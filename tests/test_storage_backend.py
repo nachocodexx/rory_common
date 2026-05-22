@@ -718,3 +718,59 @@ async def test_put_get_no_scheme_segment(client, small_matrix, storage_ids):
     get_result = await backend.get(**storage_ids, segment=True)
     assert get_result.is_ok, get_result.unwrap_err()
     assert isinstance(get_result.unwrap().raw_value, np.ndarray)
+
+
+@pytest.mark.asyncio
+async def test_put_get_skmeans_liu_udm(client, liu_params,dataowner, small_matrix, storage_ids):
+    """Test put/get of a Liu UDM object."""
+    backend = StorageBuilder(storage_client=client, scheme=Scheme.LIU, liu_params=liu_params).build()
+    udm = dataowner.get_U(
+        algorithm        = "SKMEANS",
+        plaintext_matrix = small_matrix,
+    )
+    print(udm.shape)
+    result = await backend.put(
+        bucket_id = storage_ids['bucket_id'],
+        ball_id   = storage_ids['ball_id'],
+        data      = udm,
+        delete    = True,
+        encrypt   = False,
+        segment   = True,
+        tags={}
+    )
+    assert result.is_ok, f"Error: {result.unwrap_err()}"
+    result = await backend.get(
+        bucket_id = storage_ids['bucket_id'],
+        ball_id   = storage_ids['ball_id'],
+        encrypt   = False,
+        segment   = True,
+    )
+    assert result.is_ok, f"Error: {result.unwrap_err()}"
+
+@pytest.mark.asyncio
+async def test_put_get_dbskmeans_udm(client, fdhope_params, dataowner, small_matrix, storage_ids):
+    """Test put/get of a FDHOPE UDM object."""
+    backend = StorageBuilder(storage_client=client, scheme=Scheme.FDHOPE, fdhope_params=fdhope_params).build()
+    algorithm = "DBSKMEANS"
+    udm = dataowner.get_U(
+        algorithm        = algorithm,
+        plaintext_matrix = small_matrix,
+    )
+    print(udm.shape)
+    result = await backend.put(
+        bucket_id = storage_ids['bucket_id'],
+        ball_id   = storage_ids['ball_id'],
+        data      = udm,
+        delete    = True,
+        encrypt   = True,
+        segment   = True,
+        tags={}
+    )
+    assert result.is_ok, f"Error: {result.unwrap_err()}"
+    result = await backend.get(
+        bucket_id = storage_ids['bucket_id'],
+        ball_id   = storage_ids['ball_id'],
+        encrypt   = True,
+        segment   = True,
+    )
+    assert result.is_ok, f"Error: {result.unwrap_err()}"

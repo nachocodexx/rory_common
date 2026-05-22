@@ -1,3 +1,4 @@
+import logging
 import time as T
 import asyncio
 import warnings
@@ -30,6 +31,20 @@ if os.path.exists(RORY_COMMON_ENV_FILE_PATH):
     load_dotenv(dotenv_path=RORY_COMMON_ENV_FILE_PATH)
 
 
+def _parse_log_level(value: Union[str, int], env_var_name: str) -> int:
+    if isinstance(value, int):
+        return value
+
+    normalized_value = str(value).strip()
+    if normalized_value.isdigit():
+        return int(normalized_value)
+
+    level = logging.getLevelNamesMapping().get(normalized_value.upper())
+    if level is None:
+        raise ValueError(f"Invalid log level for {env_var_name}: {value}")
+    return level
+
+
 
 
 
@@ -57,6 +72,16 @@ if RORY_COMMON_LOG_MICTLANX_PROPAGATE:
 
 from mictlanx import AsyncClient
 from mictlanx.utils.segmentation import Chunks,Chunk
+
+
+RORY_COMMON_LOG_CONSOLE_HANDLER_LEVEL = _parse_log_level(
+    RORY_COMMON_LOG_CONSOLE_HANDLER_LEVEL,
+    "RORY_COMMON_LOG_CONSOLE_HANDLER_LEVEL",
+)
+RORY_COMMON_LOG_FILE_HANDLER_LEVEL = _parse_log_level(
+    RORY_COMMON_LOG_FILE_HANDLER_LEVEL,
+    "RORY_COMMON_LOG_FILE_HANDLER_LEVEL",
+)
 
 L = Log(
     name                  = __name__,
@@ -826,6 +851,7 @@ class StorageBackend:
             p = self.params
             _scheme = scheme or self.scheme
             # CKKS encrypted chunks → get_pyctxt
+            t_read = T.monotonic()
             if encrypt and _scheme == Scheme.CKKS:
                 pyctxts = await Common.get_pyctxt(
                     client            = self.client,
@@ -843,7 +869,8 @@ class StorageBackend:
                     http2             = p.http2,
                     chunk_index       = p.chunk_index,
                 )
-                return Ok(GetResult(source=SourceType.CLOUD, raw_value=pyctxts))
+                read_time = T.monotonic() - t_read
+                return Ok(GetResult(source=SourceType.CLOUD, raw_value=pyctxts, read_time=read_time))
 
             # FDHOPE/LIU/plain segmented retrieval → get_and_merge
             if encrypt or segment:
@@ -863,7 +890,8 @@ class StorageBackend:
                     http2             = p.http2,
                     chunk_index       = p.chunk_index,
                 )
-                return Ok(GetResult(source=SourceType.CLOUD, raw_value=merged))
+                read_time = T.monotonic() - t_read
+                return Ok(GetResult(source=SourceType.CLOUD, raw_value=merged, read_time=read_time))
 
             # Default: single blob → get_matrix_or_error
             matrix = await Common.get_matrix_or_error(
@@ -882,7 +910,8 @@ class StorageBackend:
                 http2             = p.http2,
                 chunk_index       = p.chunk_index,
             )
-            return Ok(GetResult(source=SourceType.CLOUD, raw_value=matrix))
+            read_time = T.monotonic() - t_read
+            return Ok(GetResult(source=SourceType.CLOUD, raw_value=matrix, read_time=read_time))
 
         except Exception as e:
             return Err(e)
@@ -2689,7 +2718,7 @@ class Common:
                     })
                     i+=1
             else:
-                L.error({
+                L.warning({
                     "error":str(_delete_result.unwrap_err()),
                     "bucket_id":bucket_id,
                     "ball_id":key,

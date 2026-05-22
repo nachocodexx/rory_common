@@ -156,8 +156,4 @@ async def test_integration_ckks_vector_to_cloud(test_env_args, ckks_keys_args,ck
         ckks= ckks
     )
     assert len(result) == len(vector)
-    # print("VECTOR LEN:", len(vector))
-    # print("ENCRYPTED VECTOR:", len(result))
-    # print("Decrypted vector:", result)
-    # print("Decrypted vector:", result.unwrap())
-    # assert result.is_ok
+ 
