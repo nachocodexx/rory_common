@@ -870,7 +870,14 @@ class StorageBackend:
                     chunk_index       = p.chunk_index,
                 )
                 read_time = T.monotonic() - t_read
-                return Ok(GetResult(source=SourceType.CLOUD, raw_value=pyctxts, read_time=read_time))
+                return Ok(
+                    GetResult(
+                        source    = SourceType.CLOUD,
+                        raw_value = pyctxts,
+                        read_time = read_time,
+                        dtype     = str(np.dtype("object"))
+                    )
+                )
 
             # FDHOPE/LIU/plain segmented retrieval → get_and_merge
             if encrypt or segment:
@@ -891,7 +898,14 @@ class StorageBackend:
                     chunk_index       = p.chunk_index,
                 )
                 read_time = T.monotonic() - t_read
-                return Ok(GetResult(source=SourceType.CLOUD, raw_value=merged, read_time=read_time))
+                return Ok(
+                    GetResult(
+                        source    = SourceType.CLOUD,
+                        raw_value = merged,
+                        read_time = read_time,
+                        dtype     = str(merged.dtype)
+                    )
+                )
 
             # Default: single blob → get_matrix_or_error
             matrix = await Common.get_matrix_or_error(
@@ -911,7 +925,14 @@ class StorageBackend:
                 chunk_index       = p.chunk_index,
             )
             read_time = T.monotonic() - t_read
-            return Ok(GetResult(source=SourceType.CLOUD, raw_value=matrix, read_time=read_time))
+            return Ok(
+                GetResult(
+                    source    = SourceType.CLOUD,
+                    raw_value = matrix,
+                    read_time = read_time,
+                    dtype= str(matrix.dtype)
+                )
+            )
 
         except Exception as e:
             return Err(e)

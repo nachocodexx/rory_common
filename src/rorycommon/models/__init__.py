@@ -53,11 +53,16 @@ TList = TypeVar('TList', List[bytes], List[PyCtxt], List[float], List[int], npt.
 class GetResult(Generic[TList]):
     """Model for the result of a get operation, including metadata and timing information."""
     source: Optional[SourceType] = field(default=None)
+    
     """Optional source type indicating where the data was retrieved from (e.g., FILE, URL, DATABASE, IN_MEMORY, CLOUD, OTHER)."""
     raw_value: Optional[TList] = field(default=None)
+    
     """Optional raw value retrieved from the storage backend."""
     read_time: Optional[float] = field(default=None)
     """Optional time taken to read the data from the source, in seconds."""
+    dtype: Optional[str] = field(default=None)
+    """Optional data type of the retrieved data (e.g., 'float32', 'int32', 'bytes')."""
+    
 
     def to_nd_array(self) -> Optional[npt.NDArray]:
         if self.raw_value is not None and isinstance(self.raw_value, npt.NDArray):
