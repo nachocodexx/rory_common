@@ -8,12 +8,13 @@ from concurrent.futures import ProcessPoolExecutor
 from rory.core.security.dataowner import DataOwner
 import numpy.typing as npt
 from rory.core.utils.constants import Constants
+from rory.core.utils.utils import Utils
 from rory.core.clustering.secure.pqc.skmeans import Skmeans as SkmeansPQC
 from uuid import uuid4
 
 
 @pytest.mark.asyncio
-async def test_ckks_encrypt_put_and_get_chunk(dataowner_pqc, client,generated_matrix,get_context):
+async def test_ckks_encrypt_put_and_get_chunk(dataowner_pqc, ckks, client,generated_matrix,get_context):
     # bucket_id = "rory"
     MICTLANX_BUCKET_ID = get_context["bucket_id"]
     RORY_COMMON_RECORDS = get_context["records"]
@@ -39,7 +40,7 @@ async def test_ckks_encrypt_put_and_get_chunk(dataowner_pqc, client,generated_ma
 
     res = await RoryCommon.get_pyctxt_chunk(
         client    = client,
-        ckks      = dataowner_pqc.scheme,
+        ckks      = ckks,
         ball_id   = ball_id,
         bucket_id = MICTLANX_BUCKET_ID,
         index     = 0
@@ -52,7 +53,7 @@ async def test_ckks_encrypt_put_and_get_chunk(dataowner_pqc, client,generated_ma
 @pytest.mark.asyncio
 async def test_liu_segment_encrypt_and_put_chunks(dataowner, client,generated_matrix,get_context):
     key                = uuid4().hex.replace("-","")
-    n                  = generated_matrix.shape[0]*generated_matrix.shape[1]*dataowner.m
+    n                  = generated_matrix.size
     RORY_MAX_WORKERS   = get_context["max_workers"]
     MICTLANX_BUCKET_ID = get_context["bucket_id"]
     emt = RoryCommon.segment_and_encrypt_liu_with_executor(
@@ -65,8 +66,11 @@ async def test_liu_segment_encrypt_and_put_chunks(dataowner, client,generated_ma
         plaintext_matrix = generated_matrix
     )
     # emt.sort()
+    encrypted_shape = None
     for c in emt:
         print(c.chunk_id,c.checksum,c.to_ndarray())
+        chunk_shape = c.to_ndarray().unwrap().shape
+        encrypted_shape = (generated_matrix.shape[0], generated_matrix.shape[1], chunk_shape[-1])
     # checksum,_ = XoloUtils.sha256_stream(emt.to_generator())
     # checksum1= XoloUtils.sha256(emt.to_bytes())
 
@@ -77,7 +81,7 @@ async def test_liu_segment_encrypt_and_put_chunks(dataowner, client,generated_ma
         bucket_id = MICTLANX_BUCKET_ID,
         chunks    = emt,
         tags      = {
-            "full_shape": str((generated_matrix.shape[0],generated_matrix.shape[1],dataowner.m)),
+            "full_shape": str(encrypted_shape),
             "full_dtype": str(generated_matrix.dtype)
         }
     ) 
@@ -90,7 +94,7 @@ async def test_liu_segment_encrypt_and_put_chunks(dataowner, client,generated_ma
     )
     assert get_res.is_ok, "Failed to get and merge chunks: {}".format(get_res.unwrap_err())
     merged_array = get_res.unwrap()
-    assert merged_array.shape == (generated_matrix.shape[0],generated_matrix.shape[1],dataowner.m), "Merged array shape mismatch: expected {}, got {}".format((generated_matrix.shape[0],generated_matrix.shape[1],dataowner.m), merged_array.shape)
+    assert merged_array.shape == encrypted_shape, "Merged array shape mismatch: expected {}, got {}".format(encrypted_shape, merged_array.shape)
 
 
 @pytest.mark.asyncio
@@ -102,7 +106,7 @@ async def test_liu_shortcut_segment_encrypt_and_put_chunks_with_executor(
     get_context:dict
 ):
     key                = uuid4().hex.replace("-","")
-    n                  = generated_matrix.shape[0]*generated_matrix.shape[1]*dataowner.m
+    n                  = generated_matrix.size
     RORY_MAX_WORKERS   = get_context["max_workers"]
     MICTLANX_BUCKET_ID = get_context["bucket_id"]
     
@@ -257,10 +261,7 @@ async def test_full_skmeans_pqc(executor,dataowner_pqc, client,generated_matrix,
     )
     assert put_encrypted_zero_shiftmatrix_result.is_ok, "Failed to put encrypted zero shift matrix chunks: {}".format(put_encrypted_zero_shiftmatrix_result.unwrap_err())
     # # ===================================================
-    udm            = dataowner.get_U(
-        plaintext_matrix = plaintext_matrix,
-        algorithm        = Constants.ClusteringAlgorithms.SKMEANS_PQC
-    )
+    udm = Utils.calculate_UDM(plaintext_matrix=plaintext_matrix)
 
     maybe_udm_matrix_chunks = Chunks.from_ndarray(
         ndarray      = udm,

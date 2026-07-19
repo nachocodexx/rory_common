@@ -15,7 +15,7 @@ documents internal helpers rather than the main user-facing surface.
 |---|---|
 | `StorageBackend` | The main runtime API for `put`, `put_from_file`, `get`, and backend cloning via `as_builder()` |
 | Result models | `PutPlaintextResult`, `PutCiphertextResult`, `GetResult[T]`, and `SourceType` |
-| Configuration | `StorageBuilder`, `StorageParams`, scheme-specific params, and `Scheme` |
+| Configuration | `StorageBuilder`, `StorageParams`, Rory `SchemeParams`, and Rory `Scheme` |
 | Internal helpers | `Common` methods used by the backend internally |
 
 
@@ -30,12 +30,11 @@ documents internal helpers rather than the main user-facing surface.
       heading_level: 4
       members:
         - __init__
-        - with_ckks
-        - with_ckks_params
-        - with_fdhope_params
-        - with_liu_params
+        - with_dataowner
+        - with_scheme_params
         - with_scheme
         - with_storage_params
+        - with_storage_path
         - build
 
 ### StorageParams
@@ -48,26 +47,26 @@ documents internal helpers rather than the main user-facing surface.
       heading_level: 4
 
 ### CkksParams
-::: rorycommon.CkksParams
+::: rory.core.security.scheme_params.CkksParams
     options:
       show_root_heading: false
       show_root_toc_entry: false
       heading_level: 4
 ### LiuParams
-::: rorycommon.LiuParams
+::: rory.core.security.scheme_params.LiuParams
     options:
       show_root_heading: false
       show_root_toc_entry: false
       heading_level: 4
-### FdhopeParams
+### SchemeParams
 
-::: rorycommon.FdhopeParams
+::: rory.core.security.scheme_params.SchemeParams
     options:
       show_root_heading: false
       show_root_toc_entry: false
       heading_level: 4
 ### Scheme
-::: rorycommon.Scheme
+::: rory.core.enums.schemes.Scheme
     options:
       show_root_heading: false
       show_root_toc_entry: false
@@ -78,6 +77,11 @@ documents internal helpers rather than the main user-facing surface.
 `StorageBackend` is the primary interface for storing and retrieving data.
 Construct it with `StorageBuilder` and treat `put()` / `get()` as the main
 entry points.
+
+`StorageBuilder()` without an AsyncClient selects filesystem storage rooted at
+`/rory/data`. Set `storage_path` in the constructor or call
+`.with_storage_path(path)` to use a different root. Supplying an AsyncClient
+selects Mictlan storage.
 
 ### Dispatch rules for `put()`
 
@@ -91,10 +95,9 @@ the matching `get()` call that you used in `put()`.
 | `List[int]` / `List[float]` | any | any | - | any | Auto-converted to a 1-D `float64` ndarray, then follows the ndarray rows below |
 | `ndarray` | `False` | `False` | any | any | Single plaintext blob |
 | `ndarray` | `False` | `True` | any | any | Split into `num_chunks` plaintext chunks |
-| `ndarray` | `True` | - | 1 | CKKS | Encrypt the whole vector as one ciphertext chunk |
-| `ndarray` | `True` | - | >=2 | CKKS | CKKS-encrypt chunked matrix data |
-| `ndarray` | `True` | - | any | LIU | Liu-encrypt each chunk via an initialized process pool |
-| `ndarray` | `True` | - | any | FDHOPE | Treat input as caller-computed UDM, FDHoPE-encrypt each chunk, then upload |
+| `ndarray` | `True` | `False` | any | CKKS / Liu | Encrypt through a scheme-only DataOwner as one logical chunk |
+| `ndarray` | `True` | `True` | any | CKKS / Liu | Segment and encrypt chunks in parallel through DataOwner |
+| `PyCtxt` or sequence of `PyCtxt` | `True` | any | - | CKKS | Serialize prepared ciphertext without re-encrypting |
 
 ### What `get()` returns
 
@@ -105,24 +108,14 @@ the matching `get()` call that you used in `put()`.
 |---|---|---|---|
 | `True` | - | CKKS | `List[PyCtxt]` |
 | `True` | - | LIU | `np.ndarray` |
-| `True` | - | FDHOPE | `np.ndarray` |
 | `False` | `True` | any | `np.ndarray` |
 | `False` | `False` | any | `np.ndarray` |
 
-<!-- ### FDHOPE contract
-
-FDHOPE follows the same `StorageBuilder` / `StorageBackend` public pattern as
-CKKS and LIU, with one important boundary: the backend does **not** compute
-`get_U` for you. Callers must build the UDM first, then pass that ndarray to
-`put(..., encrypt=True)` on a backend configured with `Scheme.FDHOPE`.
-
-On the caller side, `get_U` uses its own `algorithm=...` parameter; that is
-separate from `FdhopeParams.scheme`, which configures the backend's FDHOPE
-chunk-encryption step.
-
-For reads, `get(..., encrypt=True)` on an FDHOPE backend uses the generic
-`get_and_merge(...)` path and returns a merged `ndarray`. It does not run a
-separate FDHOPE reconstruction step or a CKKS-style ciphertext loader. -->
+Direct encrypted ndarray storage accepts scheme-only owners (`Algorithm.NONE`).
+Algorithm-configured owners must process the complete dataset with
+`outsourcedData()` first. Store the selected prepared artifact through the
+plaintext/chunk path, or pass prepared CKKS `PyCtxt` values with `encrypt=True`.
+This prevents invalid per-chunk UDM/DM generation.
 
 ### Delete before put (`delete=True`)
 
@@ -224,8 +217,8 @@ provenance metadata alongside it.
 
 <!-- | Field | Meaning |
 |---|---|
-| `source` | Where the payload came from. In the current cloud retrieval APIs this is `SourceType.CLOUD`. |
-| `raw_value` | The retrieved payload itself. This is polymorphic: `np.ndarray` for plaintext, LIU, FDHOPE, and segmented reads; `List[PyCtxt]` for CKKS encrypted reads. |
+| `source` | Where the payload came from: `SourceType.FILE` for filesystem storage or `SourceType.CLOUD` for Mictlan. |
+| `raw_value` | The retrieved payload itself. This is polymorphic: `np.ndarray` for plaintext, Liu, and segmented reads; `List[PyCtxt]` for CKKS encrypted reads. |
 | `read_time` | Download duration when the specific retrieval path populates it. Lower-level helpers such as `Common.from_cloud_storage_to_matrix()` set it; `StorageBackend.get()` currently returns `None` here. | -->
 
 
@@ -243,7 +236,6 @@ provenance metadata alongside it.
 | Plain single object | `np.ndarray` |
 | Plain segmented object | `np.ndarray` |
 | LIU encrypted object | `np.ndarray` |
-| FDHOPE encrypted object | `np.ndarray` |
 | CKKS encrypted object | `List[PyCtxt]` |
 
 #### Conversion helpers
@@ -279,8 +271,8 @@ typed view of `raw_value`:
 | `CLOUD` | Data came from cloud storage. This is the value currently returned by the public cloud retrieval helpers in this library. |
 | `OTHER` | Fallback for sources that do not fit the categories above. | -->
 
-In practice, when you call `StorageBackend.get()` today, you should expect
-`GetResult.source == SourceType.CLOUD`.
+`StorageBackend.get()` returns `SourceType.FILE` for a filesystem backend and
+`SourceType.CLOUD` for a Mictlan backend.
 
 
 <!-- --- -->
@@ -303,49 +295,19 @@ In practice, when you call `StorageBackend.get()` today, you should expect
         - from_matrix_on_disk_to_cloud_storage
         - from_cloud_storage_to_matrix
 
-### CKKS
+### DataOwner encryption
+
+The active encrypted-storage path calls Rory `DataOwner.outsourcedData()` for
+every plaintext chunk. CKKS workers reload the configured keys; Liu workers
+reuse the generated key and reseed their random state.
 
 ::: rorycommon.Common
     options:
       members:
-        - from_matrix_to_cloud_storage_ckks
-        - from_matrix_on_disk_to_cloud_storage_ckks
-        - from_vector_to_cloud_storage_ckks
-        - from_vector_on_disk_to_cloud_storage_ckks
-        - segment_and_encrypt_ckks_with_initialized_executor
-        - encrypt_vector_ckks_with_initialized_executor
-
-### Liu
-
-The preferred path is `StorageBackend.put` with `Scheme.LIU`, which uses the
-initialized-executor pipeline below. The `segment_and_encrypt_liu` and
-`segment_and_encrypt_liu_with_executor` helpers are deprecated and will be
-removed in **rory-common 1.0.0**.
-
-::: rorycommon.Common
-    options:
-      members:
-        - init_liu_worker_context
-        - encrypt_chunk_liu_with_initialized_executor
-        - segment_and_encrypt_liu_with_initialized_executor_timed
-        - segment_and_encrypt_liu_timed
-        - segment_and_encrypt_liu_with_executor_timed
-        - segment_and_encrypt_liu
-        - segment_and_encrypt_liu_with_executor
-
-### FDHOPE
-
-The preferred path is `StorageBackend.put` with `Scheme.FDHOPE`, using
-caller-computed UDM input plus the initialized-executor FDHOPE pipeline below.
-`StorageBackend.get(..., encrypt=True)` reads FDHOPE data back through the
-generic `get_and_merge(...)` path.
-
-::: rorycommon.Common
-    options:
-      members:
-        - init_fdhope_worker_context
-        - encrypt_chunk_fdhope_with_initialized_executor
-        - segment_and_encrypt_fdhope_with_initialized_executor_timed
+        - segment_and_encrypt_with_dataowner
+        - init_ckks_dataowner_worker
+        - init_liu_dataowner_worker
+        - encrypt_chunk_with_initialized_dataowner
 
 ### Retrieval
 

@@ -13,80 +13,76 @@ encryption, and chunked upload/download — all through [mictlanx](https://jub-e
 ```
 StorageBuilder  ──►  StorageBackend  (put / put_from_file / get)
                             │
-                         Common      (static helpers: segment, encrypt, serialize, I/O)
+                         Common      (segment, encrypt, serialize)
                             │
-                    mictlanx.AsyncClient   (network layer)
+                  ┌─────────┴─────────┐
+             filesystem          mictlanx.AsyncClient
 ```
 
 `StorageBackend` is the only surface callers should use.
 `Common` is an internal helper class — methods are called by the backend automatically.
 
+When `storage_client=None`, buckets are folders below `/rory/data`. Passing an
+`AsyncClient` keeps the existing Mictlan behavior.
+
+## Local filesystem
+
+```python
+from rorycommon import StorageBuilder
+
+# Uses /rory/data/<bucket_id>/<ball_id>/ by default.
+backend = StorageBuilder().build()
+
+# Or select another root.
+backend = StorageBuilder(storage_path="/srv/rory-data").build()
+
+await backend.put("analytics", "matrix", matrix, segment=True)
+result = await backend.get("analytics", "matrix", segment=True)
+```
+
+Each ball directory contains an atomic JSON manifest and an immutable payload
+generation. The manifest preserves array and chunk metadata and SHA-256 checksums.
+Local reads return `SourceType.FILE`; local put results include the ball directory
+in `path`.
+
 ## Supported encryption schemes
 
 | Scheme | `Scheme` value | Description | Status |
 |---|---|---|---|
-| CKKS | `Scheme.CKKS` | Approximate HE via Pyfhel — initialized-executor pipeline, fully abstracted | Stable |
-| Liu | `Scheme.LIU` | Symmetric additive HE | Stable |
-| FDHOPE | `Scheme.FDHOPE` | FDHoPE chunk encryption for caller-computed UDM matrices; reads return merged `ndarray` chunks | Stable |
-| Paillier | `Scheme.PAILLIER` | Probabilistic additive HE | **Not implemented yet** |
+| CKKS | `Scheme.CKKS` | Rory DataOwner encryption; workers reload a shared key directory | Stable |
+| Liu | `Scheme.LIU` | Rory DataOwner encryption; workers share the key and use independent randomness | Stable |
+| Paillier | `Scheme.PAILLIER` | Rory scheme exists, but storage integration is intentionally absent | Not supported |
 
-!!! note "Deprecated Liu helpers"
-    The legacy `Common` helpers `segment_and_encrypt_liu` and
-    `segment_and_encrypt_liu_with_executor` are deprecated — they emit a `DeprecationWarning`
-    and will be removed in rory-common 1.0.0. Use `StorageBackend.put` with `Scheme.LIU`
-    instead.
+Rory remains the source of truth for `Scheme`, `Algorithm`, `SchemeParams`, and
+encryption behavior. This package re-exports Rory's exact enum and parameter classes;
+it does not maintain parallel storage-specific crypto models.
 
 ## Quick start
 
 ```python
 from mictlanx import AsyncClient
-from rorycommon import StorageBuilder, StorageParams, Scheme, CkksParams, LiuParams, FdhopeParams
-from rory.core.security.cryptosystem.pqc.ckks import Ckks
-from rory.core.security.dataowner import DataOwner
+from rorycommon import CkksParams, Scheme, StorageBuilder, StorageParams
 import numpy as np
 
-ckks   = Ckks.from_pyfhel(_round=True, decimals=2, path="/rory/keys")
 client = AsyncClient(uri="mictlanx://...", client_id="my-app")
 matrix = np.random.random((64, 64))
-```
 
-=== "Fluent builder"
+backend = (
+    StorageBuilder(storage_client=client)
+    .with_scheme(Scheme.CKKS)
+    .with_scheme_params(CkksParams(keys_path="/rory/keys", decimals=2))
+    .with_storage_params(StorageParams(num_chunks=4, timeout=300))
+    .build()
+)
 
-    ```python
-    backend = (
-        StorageBuilder(storage_client=client, scheme=Scheme.CKKS)
-        .with_ckks(ckks)
-        .with_storage_params(StorageParams(num_chunks=4, timeout=300))
-        .build()
-    )
-    ```
-
-=== "Full constructor"
-
-    ```python
-    backend = StorageBuilder(
-        storage_client = client,
-        scheme      = Scheme.CKKS,
-        ckks           = ckks,
-        ckks_params    = CkksParams(
-            keys_path          = "/rory/keys",
-            ctx_filename       = "ctx",
-            pubkey_filename    = "pubkey",
-            secretkey_filename = "secretkey",
-            relinkey_filename  = "relinkey",
-            rotatekey_filename = "rotatekey",
-            decimals           = 2,
-            _round             = True,
-        ),
-    ).build()
-    ```
-
-```python
 # Upload plaintext
 result = await backend.put(bucket_id="rory", ball_id="model_v1", data=matrix)
 
-# Upload encrypted matrix (2-D)
-result = await backend.put(bucket_id="rory", ball_id="model_v1_enc", data=matrix, encrypt=True)
+# Segment, encrypt through DataOwner in parallel, and upload
+result = await backend.put(
+    bucket_id="rory", ball_id="model_v1_enc", data=matrix,
+    segment=True, encrypt=True,
+)
 
 # Upload encrypted vector (1-D) — automatically detected from ndim
 vector = np.random.random((64,))
@@ -99,8 +95,11 @@ result = await backend.put(bucket_id="rory", ball_id="model_v2_enc", data="/rory
 # Overwrite an existing object — delete before upload
 result = await backend.put(bucket_id="rory", ball_id="model_v1_enc", data=matrix, encrypt=True, delete=True)
 
-# Download — mirror the same flags used in put
-result = await backend.get(bucket_id="rory", ball_id="model_v1_enc", encrypt=True)
+# Download — mirror the segmentation/encryption flags used in put
+result = await backend.get(
+    bucket_id="rory", ball_id="model_v1_enc",
+    segment=True, encrypt=True,
+)
 ciphertexts = result.unwrap().raw_value   # List[PyCtxt]
 ```
 
@@ -119,41 +118,41 @@ matrix = value.raw_value          # np.ndarray
 
 ## Advanced usage
 
-### Forking a backend for a different scheme
+### Supplying a DataOwner directly
 
-`as_builder()` snapshots every field of a running backend (client, params, key filenames,
-CKKS context, etc.) into a fresh `StorageBuilder`. Override only what differs with the
-fluent `.with_*()` methods, then call `.build()`.
-
-This is the recommended way to run the same workload under multiple schemes without
-re-wiring the shared infrastructure:
+Use caller-owned mode when the application already constructs its Rory DataOwner:
 
 ```python
-from rorycommon import StorageBuilder, StorageParams, Scheme
+from rory.core.security.dataowner import DataOwner
+from rorycommon import LiuParams, Scheme, StorageBuilder
 
-# base CKKS backend
-ckks_backend = (
-    StorageBuilder(storage_client=client, scheme=Scheme.CKKS)
-    .with_ckks(ckks)
-    .with_storage_params(StorageParams(num_chunks=4))
+owner = (
+    DataOwner.with_scheme(Scheme.LIU)
+    .with_scheme_params(LiuParams(security_level=128))
     .build()
 )
-
-# fork into a Liu backend — client and params are inherited
-liu_backend = (
-    ckks_backend.as_builder()
-    .with_scheme(Scheme.LIU)
-    .with_liu_params(LiuParams(security_level=128, decimals=2, _round=True))
-    .build()
-)
-
-result = await liu_backend.put(bucket_id="rory", ball_id="model_liu", data=matrix, encrypt=True)
+backend = StorageBuilder(storage_client=client, dataowner=owner).build()
 ```
 
-The same pattern applies to FDHOPE: switch to `Scheme.FDHOPE`, provide
-`FdhopeParams`, and pass a caller-computed UDM ndarray to `put(..., encrypt=True)`.
-The caller-side `get_U` API uses `algorithm="DBSKMEANS"` (or another caller-side algorithm value), while the backend FDHOPE config uses
-`FdhopeParams.scheme`.
+For direct storage encryption, that owner must be scheme-only (`Algorithm.NONE`).
+Algorithm-configured owners must run `outsourcedData()` once on the complete dataset;
+then store the chosen prepared artifact without asking storage to repeat encryption.
+
+```python
+prepared = algorithm_owner.outsourcedData(matrix)
+generic_backend = StorageBuilder(storage_client=client).build()
+
+result = await generic_backend.put(
+    bucket_id="rory",
+    ball_id="prepared_udm",
+    data=prepared.UDM,
+    segment=True,
+    encrypt=False,
+)
+```
+
+Prepared CKKS `PyCtxt` values are accepted with `encrypt=True`. They are detected and
+serialized directly, without a second encryption pass.
 
 ## Generating CKKS keys
 
@@ -206,11 +205,6 @@ Copy `.env.test` to `.env` and fill in the values for your environment before ru
 | Variable | Default | Purpose |
 |---|---|---|
 | `RORY_KEYS_PATH` | `/rory/keys/test2` | Directory containing CKKS key files |
-| `RORY_COMMON_CTX_FILENAME` | `ctx` | CKKS context file name |
-| `RORY_COMMON_PUBKEY_FILENAME` | `pubkey` | CKKS public key file name |
-| `RORY_COMMON_SECRETKEY_FILENAME` | `secretkey` | CKKS secret key file name |
-| `RORY_COMMON_RELINKEY_FILENAME` | `relinkey` | CKKS relinearization key file name |
-| `RORY_COMMON_ROTATEKEY_FILENAME` | `rotatekey` | CKKS rotation key file name |
 | `RORY_COMMON_SECURITY_LEVEL` | `128` | CKKS security level in bits |
 | `RORY_COMMON_CKKS_DECIMALS` | `2` | Decimal precision for CKKS (used by test fixtures) |
 | `RORY_COMMON_CKKS_SECURITY_LEVEL` | `128` | Security level for CKKS (used by test fixtures) |

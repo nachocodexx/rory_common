@@ -10,17 +10,28 @@ import numpy.typing as npt
 import pandas as pd
 import os
 from typing import Self, Tuple, Generator, Dict, AsyncGenerator, Optional, Union, List, Awaitable,Any
+from dataclasses import dataclass, field, replace
+from rory.core.enums.algorithms import Algorithm
+from rory.core.enums.schemes import Scheme
 from rory.core.security.dataowner import DataOwner
+from rory.core.security.scheme_params import (
+    SchemeParams,
+    CkksParams,
+    LiuParams,
+    PaillierParams,
+    LiuAndFdhopeParams,
+    CkksAndFdhopeParams,
+)
 from rory.core.security.dataowner_paillier import DataOwner as DataOwnerPHE
 from rory.core.security.cryptosystem.liu import Liu
 from rory.core.security.cryptosystem.fdhope import Fdhope
-from rory.core.security.pqc.dataowner import DataOwner as DataOwnerPQC
 from concurrent.futures import ProcessPoolExecutor
 from Pyfhel import PyCtxt
 import pickle
 from rory.core.security.cryptosystem.pqc.ckks import Ckks
 import hashlib as H
 from rorycommon.models import PutPlaintextResult, PutCiphertextResult,GetResult,TList,SourceType
+from rorycommon.storage import FileSystemStorage
 
 from mictlanx.logger.log import Log
 from dotenv import load_dotenv
@@ -95,29 +106,6 @@ L = Log(
     when                  = RORY_COMMON_LOG_WHEN
 )
 
-from enum import Enum
-class Scheme(Enum):
-    """`Scheme` selects the encryption/retrieval strategy used by `StorageBackend`.
-
-
-    Attributes:
-        CKKS: Approximate homomorphic encryption via Pyfhel. Fully abstracted —
-            uses the initialized-executor pipeline so keys are loaded once per
-            worker process. **Recommended for production.**
-        LIU: Symmetric additive homomorphic encryption. Uses the
-            initialized-executor pipeline so DataOwner is loaded once per worker.
-        PAILLIER: Probabilistic additive homomorphic encryption (phe). Reserved,
-            not yet wired into ``StorageBackend``.
-        FDHOPE: FDHoPE order-preserving/revealing encryption via the UDM pipeline.
-            Uses the initialized-executor pipeline so DataOwner is loaded once per
-            worker process.
-    """
-    LIU = "liu"
-    CKKS = "ckks"
-    PAILLIER = "paillier"
-    FDHOPE = "fdhope"
-from dataclasses import dataclass, field
-
 @dataclass
 class StorageParams:
     """Tuning parameters applied to every `put()` / `get()` call on the backend. Pass a custom instance to `StorageBuilder.__init__` or `.with_storage_params()`.
@@ -147,92 +135,14 @@ class StorageParams:
     max_parallel_gets: int = field(default=10)
     timeout: int = field(default=300)
 
-
-@dataclass
-class CkksParams:
-    """CKKS key-file locations and encoding configuration. Required for `StorageBackend.put(..., encrypt=True)` on a CKKS backend.
-
-    Attributes:
-        keys_path: Directory that holds CKKS key files — required for ``put`` with
-            ``encrypt=True`` (keys are loaded once per worker process).
-        ctx_filename: CKKS context filename inside ``keys_path``.
-        pubkey_filename: Public key filename.
-        secretkey_filename: Secret key filename.
-        relinkey_filename: Relinearization key filename.
-        rotatekey_filename: Rotation key filename.
-        decimals: Fixed-point precision for CKKS encoding.
-        _round: Round values after CKKS decoding.
-    """
-    keys_path:          str
-    ctx_filename:       str  = "ctx"
-    pubkey_filename:    str  = "pubkey"
-    secretkey_filename: str  = "secretkey"
-    relinkey_filename:  str  = ""
-    rotatekey_filename: str  = ""
-    decimals:           int  = 2
-    _round:             bool = False
-
-
-@dataclass
-class LiuParams:
-    """Liu-scheme construction parameters. Required for `StorageBackend.put(..., encrypt=True)` on a LIU backend.
-
-    Holds everything needed to build a ``DataOwner`` inside each worker process,
-    avoiding pickling of the ``DataOwner`` object on every task submission.
-
-    Attributes:
-        _round: Round values after Liu decoding.
-        decimals: Fixed-point decimal precision.
-        secure_random: Use a cryptographically secure RNG.
-        seed: RNG seed — shared across all workers; derive per-worker if correlated
-            randomness is a concern.
-        use_np_random: Use numpy's RNG inside the Liu scheme.
-        security_level: Security level in bits.
-    """
-    _round:         bool = False
-    decimals:       int  = 2
-    secure_random:  bool = False
-    seed:           int  = 1
-    use_np_random:  bool = True
-    security_level: int  = 128
-
-
-@dataclass
-class FdhopeParams:
-    """FDHOPE scheme construction parameters. Required for `StorageBackend.put(..., encrypt=True)` on an FDHOPE backend.
-
-    Holds everything needed to build a ``DataOwner`` inside each worker process,
-    avoiding pickling of the ``DataOwner`` object on every task submission.
-
-    Attributes:
-        scheme: FDHoPE algorithm string, e.g. ``"DBSKMEANS"``.
-        sens: Sensitivity parameter for the FDHoPE encryption.
-        _round: Round values after FDHoPE decoding.
-        decimals: Fixed-point decimal precision.
-        secure_random: Use a cryptographically secure RNG.
-        seed: RNG seed — shared across all workers; derive per-worker if correlated
-            randomness is a concern.
-        use_np_random: Use numpy's RNG inside the Liu scheme underlying FDHoPE.
-        security_level: Security level in bits.
-    """
-    scheme:         str
-    sens:           float = 0.00001
-    _round:         bool  = False
-    decimals:       int   = 2
-    secure_random:  bool  = False
-    seed:           int   = 1
-    use_np_random:  bool  = True
-    security_level: int   = 128
-
-
 class StorageBuilder:
     """Fluent builder for ``StorageBackend``.
 
     Example:
         ```python
         backend = (
-            StorageBuilder(storage_client=client, scheme=Scheme.CKKS, ckks=ckks)
-            .with_ckks_params(CkksParams(keys_path="/rory/keys"))
+            StorageBuilder(storage_client=client, scheme=Scheme.CKKS)
+            .with_scheme_params(CkksParams(keys_path="/rory/keys"))
             .with_storage_params(StorageParams(num_chunks=4))
             .build()
         )
@@ -241,81 +151,43 @@ class StorageBuilder:
 
     def __init__(
         self,
-        storage_client: AsyncClient,
-        scheme: Optional[Scheme]= None,
-        ckks: Optional[Ckks] = None,
-        ckks_params: Optional[CkksParams] = None,
-        liu_params: Optional[LiuParams] = None,
-        fdhope_params: Optional[FdhopeParams] = None,
+        storage_client: Optional[AsyncClient] = None,
+        dataowner: Optional[DataOwner] = None,
+        scheme: Optional[Scheme] = None,
+        scheme_params: Optional[SchemeParams] = None,
         params: Optional[StorageParams] = None,
+        storage_path: str = "/rory/data",
     ):
         """
         Args:
-            storage_client: Async mictlanx client used for all I/O.
-            scheme: Encryption scheme (``Scheme.CKKS``, ``Scheme.LIU``, or ``Scheme.FDHOPE``).
-            ckks: Pre-built ``Ckks`` context — required for CKKS ``get`` (deserialization).
-            ckks_params: CKKS key-file locations and encoding config — required for CKKS
-                ``put`` with ``encrypt=True``.
-            liu_params: Liu-scheme construction params — required for LIU ``put`` with
-                ``encrypt=True``.
-            fdhope_params: FDHoPE scheme construction params — required for FDHOPE ``put``
-                with ``encrypt=True``.
+            storage_client: Async mictlanx client used for remote I/O. When
+                ``None``, use filesystem storage.
+            dataowner: Caller-built Rory DataOwner. Mutually exclusive with
+                ``scheme`` and ``scheme_params``.
+            scheme: Rory scheme used to build a scheme-only DataOwner.
+            scheme_params: Rory parameters for ``scheme``.
             params: Retrieval/upload tuning. Defaults to ``StorageParams()``.
+            storage_path: Filesystem root used when ``storage_client`` is ``None``.
+                Defaults to ``/rory/data``.
         """
         self.storage_client = storage_client
+        self.dataowner      = dataowner
         self.scheme         = scheme
-        self.ckks           = ckks
-        self.ckks_params    = ckks_params
-        self.liu_params     = liu_params
-        self.fdhope_params  = fdhope_params
+        self.scheme_params  = scheme_params
         self.params         = params or StorageParams()
+        self.storage_path   = storage_path
 
-    def with_ckks(self, ckks: Ckks) -> Self:
-        """Replace the CKKS context and return ``self`` for chaining.
-
-        Args:
-            ckks: New ``Ckks`` instance.
-
-        Returns:
-            StorageBuilder
-        """
-        self.ckks = ckks
+    def with_dataowner(self, dataowner: DataOwner) -> Self:
+        """Use a caller-built DataOwner and clear scheme configuration."""
+        self.dataowner = dataowner
+        self.scheme = None
+        self.scheme_params = None
         return self
 
-    def with_ckks_params(self, ckks_params: CkksParams) -> Self:
-        """Replace the CKKS params and return ``self`` for chaining.
-
-        Args:
-            ckks_params: New ``CkksParams`` instance.
-
-        Returns:
-            StorageBuilder
-        """
-        self.ckks_params = ckks_params
-        return self
-
-    def with_liu_params(self, liu_params: LiuParams) -> Self:
-        """Replace the Liu params and return ``self`` for chaining.
-
-        Args:
-            liu_params: New ``LiuParams`` instance.
-
-        Returns:
-            StorageBuilder
-        """
-        self.liu_params = liu_params
-        return self
-
-    def with_fdhope_params(self, fdhope_params: FdhopeParams) -> Self:
-        """Replace the FDHoPE params and return ``self`` for chaining.
-
-        Args:
-            fdhope_params: New ``FdhopeParams`` instance.
-
-        Returns:
-            StorageBuilder
-        """
-        self.fdhope_params = fdhope_params
+    def with_scheme_params(self, scheme_params: SchemeParams) -> Self:
+        """Set Rory scheme parameters and switch to builder-owned mode."""
+        self.dataowner = None
+        self.scheme_params = scheme_params
         return self
 
     def with_scheme(self, scheme: Scheme) -> Self:
@@ -327,6 +199,7 @@ class StorageBuilder:
         Returns:
             StorageBuilder
         """
+        self.dataowner = None
         self.scheme = scheme
         return self
 
@@ -342,6 +215,12 @@ class StorageBuilder:
         self.params = params
         return self
 
+    def with_storage_path(self, storage_path: str) -> Self:
+        """Select filesystem storage rooted at ``storage_path``."""
+        self.storage_client = None
+        self.storage_path = storage_path
+        return self
+
     def build(self) -> "StorageBackend":
         """Construct and return the configured ``StorageBackend``.
 
@@ -350,23 +229,23 @@ class StorageBuilder:
         """
         return StorageBackend(
             client        = self.storage_client,
+            dataowner     = self.dataowner,
             scheme        = self.scheme,
-            ckks          = self.ckks,
-            ckks_params   = self.ckks_params,
-            liu_params    = self.liu_params,
-            fdhope_params = self.fdhope_params,
+            scheme_params = self.scheme_params,
             params        = self.params,
+            storage_path  = self.storage_path,
         )
 
 
 class StorageBackend:
-    """Scheme-dispatched storage façade over ``Common``.
+    """DataOwner-backed storage façade over ``Common``.
 
     Construct via ``StorageBuilder`` — do not instantiate directly.
 
-    ``put``, ``put_from_file``, and ``get`` route to the appropriate
-    ``Common`` helper based on ``self.scheme`` and the ``segment``/``encrypt``
-    flags, so callers never need to reference ``Common`` directly.
+    ``put``, ``put_from_file``, and ``get`` combine Rory ``DataOwner``
+    encryption with storage segmentation and I/O. Callers may provide a
+    ready ``DataOwner`` or let ``StorageBuilder`` construct a scheme-only one
+    from Rory's ``Scheme`` and ``SchemeParams`` types.
 
     Example:
         ```python
@@ -382,21 +261,184 @@ class StorageBackend:
 
     def __init__(
         self,
-        client: AsyncClient,
-        scheme: Optional[Scheme]= None,
-        ckks: Optional[Ckks] = None,
-        ckks_params: Optional[CkksParams] = None,
-        liu_params: Optional[LiuParams] = None,
-        fdhope_params: Optional[FdhopeParams] = None,
+        client: Optional[AsyncClient] = None,
+        dataowner: Optional[DataOwner] = None,
+        scheme: Optional[Scheme] = None,
+        scheme_params: Optional[SchemeParams] = None,
         params: Optional[StorageParams] = None,
+        storage_path: str = "/rory/data",
     ):
+        if dataowner is not None and (scheme is not None or scheme_params is not None):
+            raise ValueError("dataowner is mutually exclusive with scheme configuration")
         self.client        = client
-        self.scheme        = scheme
-        self.ckks          = ckks
-        self.ckks_params   = ckks_params
-        self.liu_params    = liu_params
-        self.fdhope_params = fdhope_params
+        self.dataowner     = dataowner
+        self.scheme        = dataowner.scheme if dataowner is not None else (scheme or Scheme.NONE)
+        self.scheme_params = dataowner.scheme_params if dataowner is not None else scheme_params
         self.params        = params or StorageParams()
+        self.storage_path  = storage_path
+        self.filesystem    = FileSystemStorage(storage_path) if client is None else None
+
+    def _require_dataowner(self) -> DataOwner:
+        if self.dataowner is None:
+            if self.scheme in {None, Scheme.NONE}:
+                raise ValueError("A DataOwner or encryption scheme is required")
+            builder = DataOwner.with_scheme(self.scheme)
+            if self.scheme_params is not None:
+                builder = builder.with_scheme_params(self.scheme_params)
+            self.dataowner = builder.build()
+        return self.dataowner
+
+    def _ckks_context(self) -> Ckks:
+        owner = self._require_dataowner().initialize()
+        if owner.scheme not in {Scheme.CKKS, Scheme.CKKS_AND_FDHOPE}:
+            raise ValueError("The configured DataOwner does not contain CKKS")
+        return owner.primary_scheme
+
+    @staticmethod
+    def _pyctxt_values(data: Any) -> Optional[List[PyCtxt]]:
+        if isinstance(data, PyCtxt):
+            return [data]
+        if isinstance(data, np.ndarray):
+            values = list(data.reshape(-1))
+        elif isinstance(data, (list, tuple)):
+            values = list(data)
+        else:
+            return None
+        if values and all(isinstance(value, PyCtxt) for value in values):
+            return values
+        return None
+
+    @property
+    def is_filesystem(self) -> bool:
+        return self.filesystem is not None
+
+    def _result_path(self, bucket_id: str, ball_id: str) -> Optional[str]:
+        if self.filesystem is None:
+            return None
+        return str(self.filesystem.object_path(bucket_id, ball_id))
+
+    async def _delete_ball(self, bucket_id: str, ball_id: str) -> None:
+        if self.filesystem is not None:
+            await self.filesystem.delete(bucket_id, ball_id)
+            return
+        await Common.while_not_delete_ball_id(
+            STORAGE_CLIENT=self.client,
+            bucket_id=bucket_id,
+            key=ball_id,
+            timeout=self.params.timeout,
+            max_tries=self.params.max_attempts,
+        )
+
+    async def _put_ndarray(
+        self,
+        bucket_id: str,
+        ball_id: str,
+        matrix: npt.NDArray,
+        tags: Dict[str, str],
+        *,
+        segment: bool,
+        encrypt: bool,
+    ) -> Result[Any, Exception]:
+        if self.filesystem is not None:
+            try:
+                path = await self.filesystem.put_ndarray(
+                    bucket_id,
+                    ball_id,
+                    matrix,
+                    tags,
+                    segment=segment,
+                    encrypt=encrypt,
+                )
+                return Ok(path)
+            except Exception as error:
+                return Err(error)
+        return await Common.put_ndarray_no_delete(
+            client=self.client,
+            bucket_id=bucket_id,
+            key=ball_id,
+            matrix=matrix,
+            tags=tags,
+            timeout=self.params.timeout,
+            max_retries=self.params.max_attempts,
+        )
+
+    async def _put_chunks(
+        self,
+        bucket_id: str,
+        ball_id: str,
+        chunks: Chunks,
+        tags: Dict[str, str],
+        *,
+        segment: bool,
+        encrypt: bool,
+    ) -> Result[Any, Exception]:
+        if self.filesystem is not None:
+            try:
+                path = await self.filesystem.put_chunks(
+                    bucket_id,
+                    ball_id,
+                    chunks,
+                    tags,
+                    segment=segment,
+                    encrypt=encrypt,
+                )
+                return Ok(path)
+            except Exception as error:
+                return Err(error)
+        return await Common.put_chunks_no_delete(
+            client=self.client,
+            bucket_id=bucket_id,
+            key=ball_id,
+            chunks=chunks,
+            tags=tags,
+            timeout=self.params.timeout,
+            max_retries=self.params.max_attempts,
+        )
+
+    async def _get_from_filesystem(
+        self,
+        bucket_id: str,
+        ball_id: str,
+        *,
+        segment: bool,
+        encrypt: bool,
+    ) -> GetResult:
+        if self.filesystem is None:
+            raise RuntimeError("Filesystem storage is not configured")
+        started = T.monotonic()
+        kind, stored_value = await self.filesystem.get_object(
+            bucket_id,
+            ball_id,
+            segment=segment,
+            encrypt=encrypt,
+        )
+        if kind == "ndarray":
+            value = stored_value
+        else:
+            chunks = stored_value
+            if encrypt and self.scheme in {Scheme.CKKS, Scheme.CKKS_AND_FDHOPE}:
+                ckks = self._ckks_context()
+                value = []
+                for chunk in chunks.sorted_by():
+                    serialized = pickle.loads(chunk.data)
+                    value.extend(Common.from_bytes_to_pyctxt_list(ckks=ckks, xs=serialized))
+            else:
+                arrays = []
+                for chunk in chunks.sorted_by():
+                    restored = chunk.to_ndarray()
+                    if restored.is_none:
+                        raise ValueError(f"Chunk {chunk.index} is not an ndarray")
+                    arrays.append(restored.unwrap())
+                if not arrays:
+                    raise ValueError("Stored object contains no chunks")
+                value = np.concatenate(arrays, axis=0)
+        dtype = str(np.dtype("object")) if isinstance(value, list) else str(value.dtype)
+        return GetResult(
+            source=SourceType.FILE,
+            raw_value=value,
+            read_time=T.monotonic() - started,
+            dtype=dtype,
+        )
 
     def as_builder(self) -> StorageBuilder:
         """Return a ``StorageBuilder`` pre-populated with this backend's configuration.
@@ -410,7 +452,7 @@ class StorageBackend:
             liu_backend = (
                 ckks_backend.as_builder()
                 .with_scheme(Scheme.LIU)
-                .with_liu_params(LiuParams())
+                .with_scheme_params(LiuParams())
                 .build()
             )
             ```
@@ -418,28 +460,41 @@ class StorageBackend:
         Returns:
             StorageBuilder
         """
+        if self.dataowner is not None:
+            return StorageBuilder(
+                storage_client=self.client,
+                dataowner=self.dataowner,
+                params=self.params,
+                storage_path=self.storage_path,
+            )
         return StorageBuilder(
-            storage_client = self.client,
-            scheme         = self.scheme,
-            ckks           = self.ckks,
-            ckks_params    = self.ckks_params,
-            liu_params     = self.liu_params,
-            fdhope_params  = self.fdhope_params,
-            params         = self.params,
+            storage_client=self.client,
+            scheme=self.scheme,
+            scheme_params=self.scheme_params,
+            params=self.params,
+            storage_path=self.storage_path,
         )
 
     async def put(
         self,
         bucket_id: str,
         ball_id: str,
-        data: Union[npt.NDArray, List[PyCtxt], List[int], List[float], Chunks, str],
+        data: Union[
+            npt.NDArray,
+            PyCtxt,
+            List[PyCtxt],
+            Tuple[PyCtxt, ...],
+            List[int],
+            List[float],
+            Chunks,
+            str,
+        ],
         tags: Dict[str, str] = {},
         segment: bool = False,
         encrypt: bool = False,
-        scheme: Optional[Scheme] = None,
         delete: bool = False,
     ) -> Result[Union[PutPlaintextResult,PutCiphertextResult], Exception]:
-        """Upload data to cloud storage with optional segmentation and encryption.
+        """Upload data to the configured storage with optional segmentation and encryption.
 
         Dispatch table:
 
@@ -447,12 +502,10 @@ class StorageBackend:
         |---|---|---|---|---|---|
         | ``str`` (file path) | any | any | — | any | delegates to ``put_from_file`` |
         | ``List[int]`` / ``List[float]`` | any | any | — | any | auto-converted to 1-D ``float64`` ndarray, then follows the ndarray rows below |
-        | ``List[PyCtxt]`` | ``False`` | — | — | CKKS | serialize ciphertexts → ``put_chunks`` |
+        | ``PyCtxt`` / sequence of ``PyCtxt`` | ``True`` | any | — | CKKS | detect prepared ciphertexts, serialize without re-encrypting |
         | ``Chunks`` | ``False`` | — | — | any | ``put_chunks`` directly |
-        | ``ndarray`` | ``True`` | — | 1 | CKKS | vector initialized-executor CKKS pipeline |
-        | ``ndarray`` | ``True`` | — | ≥2 | CKKS | matrix initialized-executor CKKS pipeline |
-        | ``ndarray`` | ``True`` | — | any | LIU | initialized-executor Liu encryption → ``put_chunks`` |
-        | ``ndarray`` | ``True`` | — | any | FDHOPE | caller-provided UDM → initialized-executor FDHoPE encryption → ``put_chunks`` |
+        | ``ndarray`` | ``True`` | ``False`` | any | CKKS / LIU | encrypt through DataOwner as one logical chunk |
+        | ``ndarray`` | ``True`` | ``True`` | any | CKKS / LIU | segment, encrypt chunks in parallel through DataOwner |
         | ``ndarray`` | ``False`` | ``True`` | any | any | ``Chunks.from_ndarray`` → ``put_chunks`` |
         | ``ndarray`` | ``False`` | ``False`` | any | any | single blob via ``put_ndarray`` |
 
@@ -465,11 +518,11 @@ class StorageBackend:
                 When a string is passed the extension is derived from the path suffix
                 and the call is forwarded to ``put_from_file``.
             tags: Arbitrary key/value metadata stored alongside the object.
-            segment: Split into ``params.num_chunks`` plaintext chunks before uploading
-                (no effect when ``encrypt=True``).
-            encrypt: Segment *and* encrypt before uploading using the configured scheme.
-                For FDHOPE, ``data`` must already be the caller-computed UDM; the
-                backend does not compute ``get_U``.
+            segment: Split into ``params.num_chunks`` chunks. With encryption enabled,
+                each chunk is encrypted in parallel; without it, chunks remain plaintext.
+            encrypt: Encrypt numeric input through the configured scheme-only DataOwner.
+                An algorithm-configured DataOwner must first process the complete dataset;
+                store its selected output artifact as prepared data instead.
             delete: Delete any existing object at ``ball_id`` before uploading.
                 Safe to use even if the key does not exist yet.
 
@@ -479,13 +532,7 @@ class StorageBackend:
         try:
             p = self.params
             if delete:
-                await Common.while_not_delete_ball_id(
-                    STORAGE_CLIENT = self.client,
-                    bucket_id      = bucket_id,
-                    key            = ball_id,
-                    timeout        = p.timeout,
-                    max_tries      = p.max_attempts,
-                )
+                await self._delete_ball(bucket_id, ball_id)
             # File path shortcut — derive extension and delegate; delete already ran above.
             if isinstance(data, str):
                 ext = os.path.splitext(data)[1].lstrip(".")
@@ -504,58 +551,61 @@ class StorageBackend:
                     return Err(ValueError("data list is empty."))
                 data = np.array(data, dtype=np.float64)
             t0 = T.monotonic()
-            _scheme = scheme or self.scheme
-            if encrypt and _scheme is None:
-                return Err(ValueError("scheme is required when encrypt=True"))
-            # Pre-processed List[PyCtxt] — from_pyctxts_to_chunks → put_chunks
-            if isinstance(data, list) and _scheme == Scheme.CKKS and not encrypt:
-                if not all(isinstance(x, PyCtxt) for x in data):
-                    return Err(ValueError("When data is a list, all elements must be PyCtxt"))
+            _scheme = self.scheme
+            pyctxts = self._pyctxt_values(data)
+            if pyctxts is not None:
+                if not encrypt:
+                    return Err(ValueError("Prepared CKKS ciphertexts require encrypt=True"))
+                if _scheme not in {Scheme.CKKS, Scheme.CKKS_AND_FDHOPE}:
+                    return Err(ValueError("Prepared CKKS ciphertexts require a CKKS DataOwner"))
                 
                 t1 = T.monotonic()
-                chunks = Common.from_pyctxts_to_chunks(key=ball_id, xs=data, num_chunks=p.num_chunks).unwrap()
+                chunks = Common.from_pyctxts_to_chunks(
+                    key=ball_id,
+                    xs=pyctxts,
+                    num_chunks=p.num_chunks if segment else 1,
+                ).unwrap()
                 segment_time = T.monotonic() - t1
                 t2 = T.monotonic()
-                r = await Common.put_chunks_no_delete(
-                    client      = self.client,
-                    bucket_id   = bucket_id,
-                    key         = ball_id,
-                    chunks      = chunks,
-                    tags        = tags,
-                    timeout     = p.timeout,
-                    max_retries = p.max_attempts,
+                r = await self._put_chunks(
+                    bucket_id,
+                    ball_id,
+                    chunks,
+                    tags,
+                    segment=segment,
+                    encrypt=True,
                 )
 
                 if r.is_err:
                     return r
-                return Ok(PutPlaintextResult(
-                    path         = None,
+                return Ok(PutCiphertextResult(
+                    path         = self._result_path(bucket_id, ball_id),
                     extension    = "",
                     bucket_id    = bucket_id,
                     ball_id      = ball_id,
                     tags         = tags,
-                    shape        = (len(data),),
-                    dtype        = None,
+                    shape        = (len(pyctxts),),
+                    dtype        = np.dtype("object"),
                     read_time    = 0.0,
                     segment_time = segment_time,
+                    encrypt_time = 0.0,
                     upload_time  = T.monotonic() - t2,
                 ))
 
             # Pre-processed Chunks — put_chunks directly
             if isinstance(data, Chunks) and not encrypt:
-                r = await Common.put_chunks_no_delete(
-                    client      = self.client,
-                    bucket_id   = bucket_id,
-                    key         = ball_id,
-                    chunks      = data,
-                    tags        = tags,
-                    timeout     = p.timeout,
-                    max_retries = p.max_attempts,
+                r = await self._put_chunks(
+                    bucket_id,
+                    ball_id,
+                    data,
+                    tags,
+                    segment=segment,
+                    encrypt=False,
                 )
                 if r.is_err:
                     return r
                 return Ok(PutPlaintextResult(
-                    path         = None,
+                    path         = self._result_path(bucket_id, ball_id),
                     extension    = "",
                     bucket_id    = bucket_id,
                     ball_id      = ball_id,
@@ -567,114 +617,38 @@ class StorageBackend:
                     upload_time  = T.monotonic() - t0,
                 ))
 
-            # ndarray + encrypt=True + segment=True → segment + encrypt per scheme
-            ckks_predicate = isinstance(data, np.ndarray) and encrypt and _scheme == Scheme.CKKS
-            liu_predicate = isinstance(data, np.ndarray) and encrypt and _scheme == Scheme.LIU
-            fdhope_predicate = isinstance(data, np.ndarray) and encrypt and _scheme == Scheme.FDHOPE
+            if isinstance(data, np.ndarray) and encrypt:
+                owner = self._require_dataowner()
+                if owner.algorithm != Algorithm.NONE:
+                    return Err(ValueError(
+                        "Parallel storage encryption requires a scheme-only DataOwner "
+                        "(Algorithm.NONE). Run outsourcedData() on the full dataset and "
+                        "store the selected result artifact instead."
+                    ))
+                if owner.scheme == Scheme.PAILLIER:
+                    return Err(NotImplementedError("Paillier storage is not supported"))
 
-            
-            if ckks_predicate:
-                if self.ckks_params is None:
-                    return Err(ValueError("ckks_params is required for encrypted CKKS put"))
-                if data.ndim == 1:
-                    return await Common.from_vector_to_cloud_storage_ckks(
-                        vector             = data,
-                        client             = self.client,
-                        bucket_id          = bucket_id,
-                        ball_id            = ball_id,
-                        keys_path          = self.ckks_params.keys_path,
-                        ctx_filename       = self.ckks_params.ctx_filename,
-                        relinkey_filename  = self.ckks_params.relinkey_filename,
-                        rotatekey_filename = self.ckks_params.rotatekey_filename,
-                        secretkey_filename = self.ckks_params.secretkey_filename,
-                        decimals           = self.ckks_params.decimals,
-                        num_chunks         = p.num_chunks,
-                        pubkey_filename    = self.ckks_params.pubkey_filename,
-                        tags               = tags,
-                        timeout            = p.timeout,
-                        max_attempts       = p.max_attempts,
-                        _round             = self.ckks_params._round,
+                encrypted_chunks, segment_time, encrypt_time = (
+                    Common.segment_and_encrypt_with_dataowner(
+                        key        = ball_id,
+                        plaintext  = data,
+                        dataowner  = owner,
+                        num_chunks = p.num_chunks if segment else 1,
                     )
-                return await Common.from_matrix_to_cloud_storage_ckks(
-                    plaintext_matrix   = data,
-                    client             = self.client,
-                    bucket_id          = bucket_id,
-                    ball_id            = ball_id,
-                    keys_path          = self.ckks_params.keys_path,
-                    ctx_filename       = self.ckks_params.ctx_filename,
-                    relinkey_filename  = self.ckks_params.relinkey_filename,
-                    rotatekey_filename = self.ckks_params.rotatekey_filename,
-                    secretkey_filename = self.ckks_params.secretkey_filename,
-                    decimals           = self.ckks_params.decimals,
-                    num_chunks         = p.num_chunks,
-                    pubkey_filename    = self.ckks_params.pubkey_filename,
-                    tags               = tags,
-                    timeout            = p.timeout,
-                    max_attempts       = p.max_attempts,
-                    _round             = self.ckks_params._round,
-                )
-            if liu_predicate:
-                if self.liu_params is None:
-                    return Err(ValueError("liu_params is required for encrypted LIU put"))
-                (encrypted_chunks, segment_time, encrypt_time) = Common.segment_and_encrypt_liu_with_initialized_executor_timed(
-                    key              = ball_id,
-                    plaintext_matrix = data,
-                    n                = data.size,
-                    np_random        = True,
-                    liu_params       = self.liu_params,
-                    num_chunks       = p.num_chunks,
                 )
                 t1 = T.monotonic()
-                r = await Common.put_chunks_no_delete(
-                    client      = self.client,
-                    bucket_id   = bucket_id,
-                    key         = ball_id,
-                    chunks      = encrypted_chunks,
-                    tags        = tags,
-                    timeout     = p.timeout,
-                    max_retries = p.max_attempts,
+                r = await self._put_chunks(
+                    bucket_id,
+                    ball_id,
+                    encrypted_chunks,
+                    tags,
+                    segment=segment,
+                    encrypt=True,
                 )
                 if r.is_err:
                     return r
                 return Ok(PutCiphertextResult(
-                    path         = None,
-                    extension    = "",
-                    bucket_id    = bucket_id,
-                    ball_id      = ball_id,
-                    tags         = tags,
-                    shape        = data.shape,
-                    dtype        = data.dtype,
-                    read_time    = 0.0,
-                    segment_time = segment_time,
-                    encrypt_time = encrypt_time,
-                    upload_time  = T.monotonic() - t1,
-                ))
-
-
-            if fdhope_predicate:
-                if self.fdhope_params is None:
-                    return Err(ValueError("fdhope_params is required for encrypted FDHOPE put"))
-                (encrypted_chunks, segment_time, encrypt_time) = Common.segment_and_encrypt_fdhope_with_initialized_executor_timed(
-                    key           = ball_id,
-                    udm           = data,
-                    n             = data.size,
-                    fdhope_params = self.fdhope_params,
-                    num_chunks    = p.num_chunks,
-                )
-                t1 = T.monotonic()
-                r = await Common.put_chunks_no_delete(
-                    client      = self.client,
-                    bucket_id   = bucket_id,
-                    key         = ball_id,
-                    chunks      = encrypted_chunks,
-                    tags        = tags,
-                    timeout     = p.timeout,
-                    max_retries = p.max_attempts,
-                )
-                if r.is_err:
-                    return r
-                return Ok(PutCiphertextResult(
-                    path         = None,
+                    path         = self._result_path(bucket_id, ball_id),
                     extension    = "",
                     bucket_id    = bucket_id,
                     ball_id      = ball_id,
@@ -694,20 +668,19 @@ class StorageBackend:
                 plain_chunks = Chunks.from_ndarray(ndarray=data, group_id=ball_id,chunk_prefix=Some(ball_id), num_chunks=p.num_chunks).unwrap()
                 segment_time = T.monotonic() - t0
                 t1 = T.monotonic()
-                r = await Common.put_chunks_no_delete(
-                    client      = self.client,
-                    bucket_id   = bucket_id,
-                    key         = ball_id,
-                    chunks      = plain_chunks,
-                    tags        = tags,
-                    timeout     = p.timeout,
-                    max_retries = p.max_attempts,
+                r = await self._put_chunks(
+                    bucket_id,
+                    ball_id,
+                    plain_chunks,
+                    tags,
+                    segment=True,
+                    encrypt=False,
                 )
                 if r.is_err:
                     return r
                 upload_time = T.monotonic() - t1
                 return Ok(PutPlaintextResult(
-                    path         = None,
+                    path         = self._result_path(bucket_id, ball_id),
                     extension    = "",
                     bucket_id    = bucket_id,
                     ball_id      = ball_id,
@@ -721,19 +694,18 @@ class StorageBackend:
 
             # Default: single blob, no segmentation, no encryption
             t0 = T.monotonic()
-            r = await Common.put_ndarray_no_delete(
-                client      = self.client,
-                bucket_id   = bucket_id,
-                key         = ball_id,
-                matrix      = data,
-                tags        = tags,
-                timeout     = p.timeout,
-                max_retries = p.max_attempts,
+            r = await self._put_ndarray(
+                bucket_id,
+                ball_id,
+                data,
+                tags,
+                segment=False,
+                encrypt=False,
             )
             if r.is_err:
                 return r
             return Ok(PutPlaintextResult(
-                path         = None,
+                path         = self._result_path(bucket_id, ball_id),
                 extension    = "",
                 bucket_id    = bucket_id,
                 ball_id      = ball_id,
@@ -758,8 +730,8 @@ class StorageBackend:
         segment: bool = False,
         encrypt: bool = False,
         delete: bool = False,
-    ) -> Result[PutPlaintextResult, Exception]:
-        """Read an array from disk and upload it to cloud storage.
+    ) -> Result[Union[PutPlaintextResult, PutCiphertextResult], Exception]:
+        """Read an array from disk and upload it to the configured storage.
 
         For encrypted uploads the file is read first so that ``put`` can dispatch
         on ``data.ndim`` (1-D vector vs 2-D matrix).  All combinations delegate to
@@ -776,21 +748,16 @@ class StorageBackend:
             delete: Delete any existing object at ``ball_id`` before uploading.
 
         Returns:
-            ``Ok(PutPlaintextResult)`` on success, ``Err(Exception)`` on failure.
+            ``Ok(PutPlaintextResult)`` or ``Ok(PutCiphertextResult)`` on success,
+            ``Err(Exception)`` on failure.
         """
         try:
             p = self.params
             # Default: single blob, no encryption — use the dedicated disk→put helper
             # (avoids reading the whole file into memory when it's not needed).
-            if not segment and not encrypt:
+            if not self.is_filesystem and not segment and not encrypt:
                 if delete:
-                    await Common.while_not_delete_ball_id(
-                        STORAGE_CLIENT = self.client,
-                        bucket_id      = bucket_id,
-                        key            = ball_id,
-                        timeout        = p.timeout,
-                        max_tries      = p.max_attempts,
-                    )
+                    await self._delete_ball(bucket_id, ball_id)
                 return await Common.from_matrix_on_disk_to_cloud_storage(
                     path         = path,
                     extension    = extension,
@@ -821,9 +788,8 @@ class StorageBackend:
         ball_id: str,
         segment: bool = False,
         encrypt: bool = False,
-        scheme: Optional[Scheme] = None,
     ) -> Result[GetResult[TList], Exception]:
-        """Download data from cloud storage.
+        """Download data from the configured storage.
 
         Mirror the ``segment`` and ``encrypt`` flags used during the corresponding
         ``put`` call so the correct retrieval method is selected.
@@ -831,8 +797,7 @@ class StorageBackend:
         | ``encrypt`` | ``segment`` | scheme | ``GetResult.raw_value`` type |
         |---|---|---|---|
         | ``True`` | — | CKKS | ``List[PyCtxt]`` |
-        | ``True`` | — | LIU | ``np.ndarray`` (decrypted + merged) |
-        | ``True`` | — | FDHOPE | ``np.ndarray`` (merged encrypted chunks) |
+        | ``True`` | — | LIU | ``np.ndarray`` (merged ciphertext chunks) |
         | ``False`` | ``True`` | any | ``np.ndarray`` (merged chunks) |
         | ``False`` | ``False`` | any | ``np.ndarray`` (single blob) |
 
@@ -840,24 +805,31 @@ class StorageBackend:
             bucket_id: Target bucket name.
             ball_id: Key identifying the object within the bucket.
             segment: ``True`` when the data was stored as segmented chunks.
-            encrypt: ``True`` when the data was stored encrypted. For FDHOPE, this
-                routes to the generic ``get_and_merge`` path rather than a
-                scheme-specific decrypt/rebuild helper.
+            encrypt: ``True`` when DataOwner ciphertext was stored.
 
         Returns:
             ``Ok(GetResult[T])`` on success, ``Err(Exception)`` on failure.
         """
         try:
+            if self.filesystem is not None:
+                return Ok(await self._get_from_filesystem(
+                    bucket_id,
+                    ball_id,
+                    segment=segment,
+                    encrypt=encrypt,
+                ))
             p = self.params
-            _scheme = scheme or self.scheme
+            _scheme = self.scheme
+            if encrypt and _scheme == Scheme.PAILLIER:
+                return Err(NotImplementedError("Paillier storage is not supported"))
             # CKKS encrypted chunks → get_pyctxt
             t_read = T.monotonic()
-            if encrypt and _scheme == Scheme.CKKS:
+            if encrypt and _scheme in {Scheme.CKKS, Scheme.CKKS_AND_FDHOPE}:
                 pyctxts = await Common.get_pyctxt(
                     client            = self.client,
                     bucket_id         = bucket_id,
                     key               = ball_id,
-                    ckks              = self.ckks,
+                    ckks              = self._ckks_context(),
                     max_retries       = p.max_attempts,
                     delay             = p.delay,
                     backoff_factor    = p.backoff_factor,
@@ -879,7 +851,12 @@ class StorageBackend:
                     )
                 )
 
-            # FDHOPE/LIU/plain segmented retrieval → get_and_merge
+            if encrypt and _scheme != Scheme.LIU:
+                return Err(ValueError(
+                    f"Storage retrieval does not support encrypted scheme {_scheme.value}"
+                ))
+
+            # Liu/plain segmented retrieval → get_and_merge
             if encrypt or segment:
                 # print("Using get_and_merge for segmented/encrypted retrieval")
                 merged = await Common.get_and_merge(
@@ -953,10 +930,130 @@ class Common:
     - **Low-level I/O** — ``put_ndarray``, ``put_chunks``, ``delete_and_put_*``
     """
     
-    ckks = None
-    dataowner = None
-    liu_dataowner = None
+    ckks             = None
+    dataowner        = None
+    liu_dataowner    = None
     fdhope_dataowner = None
+
+    @staticmethod
+    def _encrypt_dataowner_chunk(dataowner: DataOwner, key: str, chunk: Chunk) -> Chunk:
+        plaintext = chunk.to_ndarray().unwrap()
+        encrypted = dataowner.outsourcedData(plaintext).encrypted_matrix
+        if dataowner.scheme == Scheme.CKKS:
+            ciphertexts = list(np.asarray(encrypted, dtype=object).reshape(-1))
+            return Chunk(
+                group_id=key,
+                index=chunk.index,
+                data=Common.from_pyctxt_list_to_bytes(ciphertexts),
+                chunk_id=Some(f"{key}_{chunk.index}"),
+                metadata={"cipher_format": "ckks"},
+            )
+        if dataowner.scheme == Scheme.LIU:
+            return Chunk.from_ndarray(
+                group_id=key,
+                index=chunk.index,
+                ndarray=encrypted,
+                chunk_id=Some(f"{key}_{chunk.index}"),
+            )
+        raise ValueError(f"Unsupported storage encryption scheme: {dataowner.scheme.value}")
+
+    @staticmethod
+    def init_liu_dataowner_worker(serialized_dataowner: bytes):
+        """Restore one Liu key context and assign fresh worker randomness."""
+        Common.dataowner = pickle.loads(serialized_dataowner).reseed()
+
+    @staticmethod
+    def init_ckks_dataowner_worker(params: CkksParams):
+        """Load the shared CKKS key context once in a worker process."""
+        Common.dataowner = (
+            DataOwner.with_scheme(Scheme.CKKS)
+            .with_scheme_params(params)
+            .build()
+            .initialize()
+        )
+
+    @staticmethod
+    def encrypt_chunk_with_initialized_dataowner(key: str, chunk: Chunk) -> Chunk:
+        if Common.dataowner is None:
+            raise RuntimeError("DataOwner worker context is not initialized")
+        return Common._encrypt_dataowner_chunk(Common.dataowner, key, chunk)
+
+    @staticmethod
+    def segment_and_encrypt_with_dataowner(
+        key: str,
+        plaintext: npt.NDArray,
+        dataowner: DataOwner,
+        num_chunks: int,
+    ) -> Tuple[Chunks, float, float]:
+        """Segment plaintext and encrypt every segment through Rory DataOwner."""
+        if dataowner.algorithm != Algorithm.NONE:
+            raise ValueError("Segment encryption requires Algorithm.NONE")
+        if dataowner.scheme not in {Scheme.CKKS, Scheme.LIU}:
+            raise ValueError(f"Unsupported storage encryption scheme: {dataowner.scheme.value}")
+        if num_chunks < 1:
+            raise ValueError("num_chunks must be at least 1")
+        if plaintext.ndim == 0 or plaintext.size == 0:
+            raise ValueError("plaintext must be a non-empty vector or matrix")
+
+        # Splitting happens on axis 0. Avoid empty segments for vectors and
+        # matrices with fewer rows than the configured worker count.
+        num_chunks = min(num_chunks, plaintext.shape[0])
+
+        t0 = T.monotonic()
+        chunks = Chunks.from_ndarray(
+            ndarray=plaintext,
+            group_id=key,
+            chunk_prefix=Some(key),
+            num_chunks=num_chunks,
+        ).unwrap()
+        segment_time = T.monotonic() - t0
+        t1 = T.monotonic()
+
+        if num_chunks == 1:
+            encrypted = [
+                Common._encrypt_dataowner_chunk(dataowner, key, chunk)
+                for chunk in chunks.iter()
+            ]
+            return Chunks(chs=encrypted, n=plaintext.size), segment_time, T.monotonic() - t1
+
+        if dataowner.scheme == Scheme.LIU:
+            dataowner.initialize()
+            initializer = Common.init_liu_dataowner_worker
+            initargs = (pickle.dumps(dataowner, protocol=pickle.HIGHEST_PROTOCOL),)
+        else:
+            params = dataowner.scheme_params
+            if not isinstance(params, CkksParams):
+                raise ValueError("CKKS parallel encryption requires CkksParams")
+            worker_params = params
+            if params.keys_path is None:
+                if not params.save:
+                    raise ValueError(
+                        "Parallel CKKS encryption requires keys_path or save=True"
+                    )
+                dataowner.initialize()
+                worker_params = replace(
+                    params,
+                    keys_path=params.output_path,
+                    save=False,
+                )
+            initializer = Common.init_ckks_dataowner_worker
+            initargs = (worker_params,)
+
+        with ProcessPoolExecutor(
+            max_workers=num_chunks,
+            initializer=initializer,
+            initargs=initargs,
+        ) as executor:
+            futures = [
+                executor.submit(
+                    Common.encrypt_chunk_with_initialized_dataowner,
+                    key=key,
+                    chunk=chunk,
+                )
+                for chunk in chunks.iter()
+            ]
+            encrypted = Common.to_chunks_generator(futures)
+        return Chunks(chs=encrypted, n=plaintext.size), segment_time, T.monotonic() - t1
 
 
     # Plain text
@@ -1512,8 +1609,6 @@ class Common:
     ):
         """Runs once per worker process to load the context into RAM."""
         try:
-            global ckks 
-            global dataowner
             L.debug({
                 "message": "Initializing CKKS context in worker process",
                 "path": path,
@@ -1523,7 +1618,7 @@ class Common:
                 "relinkey_filename": relinkey_filename,
                 "rotatekey_filename": rotatekey_filename,
             })
-            ckks= Ckks.from_pyfhel(
+            Common.ckks = Ckks.from_pyfhel(
                 _round             = _round,
                 decimals           = decimals,
                 path               = path,
@@ -1533,7 +1628,6 @@ class Common:
                 relinkey_filename  = relinkey_filename,
                 rotatekey_filename = rotatekey_filename 
             ) 
-            dataowner = DataOwnerPQC(scheme= ckks)
         except Exception as e:
             print(f"Failed to initialize CKKS context: {e}")
             raise e
@@ -1569,7 +1663,7 @@ class Common:
             timeout (int, optional): The timeout for the operation in seconds. Defaults to 120.
 
         """ 
-        res = dataowner.liu_encrypt_matrix_chunk(ndarray)
+        res = dataowner.outsourcedData(ndarray).encrypted_matrix
         m = res.shape[2]
         new_full_shape = (full_shape[0],full_shape[1], m)
         new_c = Chunk.from_ndarray(
@@ -1604,15 +1698,15 @@ class Common:
         bucket_id:str,
         ball_id:str,
         index:int,
-        dataowner: DataOwnerPQC,
+        dataowner: DataOwner,
         ndarray:npt.NDArray,
         full_shape:Tuple[int,int],
         num_chunks:int,
         max_backoff:int= 5, 
         max_attempts:int = 10,
         timeout:int=120
-    ):      
-            encyrpted_chunk = dataowner.ckks_encrypt_matrix_chunk(ndarray)
+    ):
+            encyrpted_chunk = dataowner.outsourcedData(ndarray).encrypted_matrix
             data = Common.from_pyctxt_list_to_bytes(xs=encyrpted_chunk)
             new_c= Chunk(
                 group_id = ball_id, 
@@ -1935,7 +2029,7 @@ class Common:
     @staticmethod
     def encrypt_chunk_liu(key:str,dataowner:DataOwner,chunk:Chunk, np_random:bool)-> Chunk:
         ptm = chunk.to_ndarray().unwrap()
-        encyrpted_chunk:npt.NDArray = dataowner.liu_encrypt_matrix_chunk(plaintext_matrix = ptm, np_random=np_random)
+        encyrpted_chunk:npt.NDArray = dataowner.outsourcedData(ptm).encrypted_matrix
         return Chunk.from_ndarray(group_id=key, index= chunk.index, ndarray= encyrpted_chunk, chunk_id=Some("{}_{}".format(key,chunk.index)))
 
 
@@ -2098,13 +2192,12 @@ class Common:
     
     @staticmethod
     def init_liu_worker_context(liu_params: "LiuParams"):
-        """Runs once per worker process to construct the Liu DataOwner into RAM.
+        """Runs once per worker process to construct the Liu cipher in RAM.
 
         Args:
             liu_params: Liu scheme construction parameters.
         """
         try:
-            global liu_dataowner
             _liu = Liu(
                 _round         = liu_params._round,
                 decimals       = liu_params.decimals,
@@ -2113,14 +2206,15 @@ class Common:
                 use_np_random  = liu_params.use_np_random,
                 security_level = liu_params.security_level,
             )
-            liu_dataowner = DataOwner(liu_scheme=_liu)
+            _liu.generate_keys(security_level=liu_params.security_level)
+            Common.liu_dataowner = _liu
         except Exception as e:
             print(f"Failed to initialize Liu worker context: {e}")
             raise e
 
     @staticmethod
     def encrypt_chunk_liu_with_initialized_executor(key: str, chunk: Chunk, np_random: bool) -> Chunk:
-        """Encrypt a single chunk using the pre-initialized Liu DataOwner in this worker process.
+        """Encrypt a single chunk using the pre-initialized Liu cipher in this worker process.
 
         Must be run inside a ``ProcessPoolExecutor`` whose ``initializer`` was
         ``init_liu_worker_context``.
@@ -2134,11 +2228,11 @@ class Common:
             Encrypted ``Chunk``.
         """
         try:
-            _ldo = globals().get("liu_dataowner")
-            if _ldo is None:
-                raise Exception("Liu dataowner not initialized. Please run init_liu_worker_context first.")
+            _liu = Common.liu_dataowner
+            if _liu is None:
+                raise Exception("Liu scheme not initialized. Please run init_liu_worker_context first.")
             ptm = chunk.to_ndarray().unwrap()
-            encrypted: npt.NDArray = _ldo.liu_encrypt_matrix_chunk(plaintext_matrix=ptm, np_random=np_random)
+            encrypted: npt.NDArray = _liu.encrypt_matrix(plaintext_matrix=ptm).data
             return Chunk.from_ndarray(group_id=key, index=chunk.index, ndarray=encrypted, chunk_id=Some("{}_{}".format(key, chunk.index)))
         except Exception as e:
             print("ENCRYPT_CHUNK_LIU_ERROR", e)
@@ -2153,10 +2247,10 @@ class Common:
         liu_params: "LiuParams",
         num_chunks: int = 2,
     ) -> Tuple[Chunks, float, float]:
-        """Segment a matrix and Liu-encrypt each chunk using a process pool with pre-initialized DataOwner.
+        """Segment a matrix and Liu-encrypt each chunk using a process pool with a pre-initialized cipher.
 
         Each worker loads the Liu context once via ``init_liu_worker_context`` rather than
-        pickling a ``DataOwner`` object for every task — mirrors the CKKS
+        rebuilding a ``Liu`` object for every task — mirrors the CKKS
         ``segment_and_encrypt_ckks_with_initialized_executor`` pattern.
 
         Args:
@@ -2190,130 +2284,22 @@ class Common:
             awaitable_chunks.append(future)
         chs = Common.to_chunks_generator(awaitable_chunks=awaitable_chunks)
         encrypt_time = T.monotonic() - t1
-        executor.shutdown(wait=False)
+        executor.shutdown(wait=True)
         return (Chunks(chs=chs, n=n), segment_time, encrypt_time)
 
     @staticmethod
-    def init_fdhope_worker_context(
-        fdhope_params: "FdhopeParams",
-        message_intervals: Dict[str, Tuple[float, float]],
-        cypher_intervals: Dict[str, Tuple[float, float]],
-    ):
-        """Runs once per worker process to construct the FDHoPE DataOwner into RAM.
-
-        Args:
-            fdhope_params: FDHoPE scheme construction parameters.
-            message_intervals: Precomputed FDHoPE message-space intervals for the full UDM.
-            cypher_intervals: Precomputed FDHoPE cipher-space intervals for the full UDM.
-        """
-        try:
-            global fdhope_dataowner
-            _liu = Liu(
-                _round         = fdhope_params._round,
-                decimals       = fdhope_params.decimals,
-                secure_random  = fdhope_params.secure_random,
-                seed           = fdhope_params.seed,
-                use_np_random  = fdhope_params.use_np_random,
-                security_level = fdhope_params.security_level,
-            )
-            fdhope_dataowner = DataOwner(liu_scheme=_liu)
-            fdhope_dataowner.messageIntervals = message_intervals
-            fdhope_dataowner.cypherIntervals = cypher_intervals
-        except Exception as e:
-            print(f"Failed to initialize FDHoPE worker context: {e}")
-            raise e
-
-    @staticmethod
-    def encrypt_chunk_fdhope_with_initialized_executor(key: str, chunk: Chunk, scheme: str, sens: float) -> Chunk:
-        """Encrypt a single chunk using the pre-initialized FDHoPE DataOwner in this worker process.
-
-        Must be run inside a ``ProcessPoolExecutor`` whose ``initializer`` was
-        ``init_fdhope_worker_context``.
-
-        Args:
-            key: Object key — used as the ``group_id`` for chunk metadata.
-            chunk: Plaintext UDM chunk to encrypt.
-            scheme: FDHoPE algorithm string, e.g. ``"DBSKMEANS"``.
-            sens: Sensitivity parameter for the FDHoPE encryption.
-
-        Returns:
-            Encrypted ``Chunk``.
-        """
-        try:
-            _fdo = globals().get("fdhope_dataowner")
-            if _fdo is None:
-                raise Exception("FDHoPE dataowner not initialized. Please run init_fdhope_worker_context first.")
-            encrypted = _fdo.encrypt_udm_chunks(plaintext_matrix=chunk.to_ndarray().unwrap(), algorithm=scheme, sens=sens)
-            return Chunk.from_ndarray(group_id=key, index=chunk.index, ndarray=encrypted.matrix, chunk_id=Some("{}_{}".format(key, chunk.index)))
-        except Exception as e:
-            print("ENCRYPT_CHUNK_FDHOPE_ERROR", e)
-            raise e
-
-    @staticmethod
-    def segment_and_encrypt_fdhope_with_initialized_executor_timed(
-        key: str,
-        udm: npt.NDArray,
-        n: int,
-        fdhope_params: "FdhopeParams",
-        num_chunks: int = 2,
-    ) -> Tuple[Chunks, float, float]:
-        """Segment a UDM and FDHoPE-encrypt each chunk using a process pool with pre-initialized DataOwner.
-
-        Each worker loads the FDHoPE context once via ``init_fdhope_worker_context`` rather than
-        pickling a ``DataOwner`` object for every task — mirrors the Liu
-        ``segment_and_encrypt_liu_with_initialized_executor_timed`` pattern.
-
-        The caller is responsible for computing the UDM before calling this method.
-        ``StorageBackend.put`` receives the already-computed UDM as ``data``.
-
-        Args:
-            key: Object key — used as the ``group_id`` for chunk metadata.
-            udm: Pre-computed UDM matrix to segment and encrypt.
-            n: Total number of elements (``udm.size``) — stored in ``Chunks.n``.
-            fdhope_params: FDHoPE scheme construction parameters forwarded to workers.
-            num_chunks: Number of chunks (also the process pool size).
-
-        Returns:
-            Tuple of ``(Chunks, segment_time, encrypt_time)`` where times are in seconds.
-        """
-        t0 = T.monotonic()
-        (message_intervals, cypher_intervals) = Fdhope.keygen(dataset=udm)
-        executor = ProcessPoolExecutor(
-            max_workers = num_chunks,
-            initializer = Common.init_fdhope_worker_context,
-            initargs    = (fdhope_params, message_intervals, cypher_intervals),
-        )
-        plaintext_matrix_chunks = Chunks.from_ndarray(ndarray=udm, group_id=key, num_chunks=num_chunks).unwrap()
-        t1 = T.monotonic()
-        segment_time = t1 - t0
-        awaitable_chunks: List[Awaitable[Chunk]] = []
-        for plaintext_matrix_chunk in plaintext_matrix_chunks.iter():
-            future = executor.submit(
-                Common.encrypt_chunk_fdhope_with_initialized_executor,
-                key    = key,
-                chunk  = plaintext_matrix_chunk,
-                scheme = fdhope_params.scheme,
-                sens   = fdhope_params.sens,
-            )
-            awaitable_chunks.append(future)
-        chs = Common.to_chunks_generator(awaitable_chunks=awaitable_chunks)
-        encrypt_time = T.monotonic() - t1
-        executor.shutdown(wait=False)
-        return (Chunks(chs=chs, n=n), segment_time, encrypt_time)
-
-    @staticmethod
-    def segment_and_encrypt_fdhope(scheme:str, key:str,dataowner:DataOwner,plaintext_matrix:npt.NDArray, n:int ,num_chunks:int=2, threshold:float = 0.0, max_workers:int = int(os.cpu_count()/2) )->Chunks:
+    def segment_and_encrypt_fdhope(scheme:str, key:str,dataowner:Fdhope,plaintext_matrix:npt.NDArray, n:int ,num_chunks:int=2, threshold:float = 0.0, max_workers:int = int(os.cpu_count()/2) )->Chunks:
         plaintext_matrix_chunks = Chunks.from_ndarray(ndarray= plaintext_matrix, group_id = key, num_chunks= num_chunks).unwrap()
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             awaitable_chunks:List[Awaitable[Chunk]] = []
             for plaintext_matrix_chunk in plaintext_matrix_chunks.iter():
-                future = executor.submit(Common.encrypt_chunk_fdhope, key = key, dataowner = dataowner, chunk = plaintext_matrix_chunk, scheme = scheme, threshold = threshold)
+                future = executor.submit(Common.encrypt_chunk_fdhope, key = key, dataowner = dataowner, chunk = plaintext_matrix_chunk, scheme = scheme, sens = threshold)
                 awaitable_chunks.append(future)
             return Chunks(chs= Common.to_chunks_generator(awaitable_chunks=awaitable_chunks),n =n  )
 
 
     @staticmethod
-    def segment_and_encrypt_fdhope_with_executor(executor:ProcessPoolExecutor,scheme:str, key:str,dataowner:DataOwner,matrix:npt.NDArray, n:int ,num_chunks:int=2, sens:float = 0.00001 ):
+    def segment_and_encrypt_fdhope_with_executor(executor:ProcessPoolExecutor,scheme:str, key:str,dataowner:Fdhope,matrix:npt.NDArray, n:int ,num_chunks:int=2, sens:float = 0.00001 ):
         plaintext_matrix_chunks = Chunks.from_ndarray(ndarray= matrix, group_id = key, num_chunks= num_chunks).unwrap()
         awaitable_chunks:List[Awaitable[Chunk]] = []
         for plaintext_matrix_chunk in plaintext_matrix_chunks.iter():
@@ -2323,14 +2309,16 @@ class Common:
 
 
     @staticmethod
-    def encrypt_chunk_fdhope(key:str,dataowner:DataOwner,chunk:Chunk,scheme:str,sens:float=0.00001)-> Chunk:
+    def encrypt_chunk_fdhope(key:str,dataowner:Fdhope,chunk:Chunk,scheme:str,sens:float=0.00001)-> Chunk:
         try:
-            encyrpted_chunk = dataowner.encrypt_udm_chunks(
-                plaintext_matrix = chunk.to_ndarray().unwrap(),
-                algorithm     = scheme,
-                sens             = sens
-                )
-            return Chunk.from_ndarray(group_id=key, index= chunk.index, ndarray= encyrpted_chunk.matrix, chunk_id=Some("{}_{}".format(key,chunk.index)))
+            plaintext = chunk.to_ndarray().unwrap()
+            if scheme == "DBSKMEANS":
+                encrypted = dataowner.encrypt_tensor(plaintext_tensor=plaintext, sens=sens).data
+            elif scheme == "DBSNNC":
+                encrypted = dataowner.encrypt_matrix(plaintext_matrix=plaintext, sens=sens).data
+            else:
+                raise ValueError(f"Unknown FDHOPE algorithm: {scheme}")
+            return Chunk.from_ndarray(group_id=key, index= chunk.index, ndarray=encrypted, chunk_id=Some("{}_{}".format(key,chunk.index)))
         except Exception as e:
             print("ERROR", e)
             raise e
@@ -2430,7 +2418,7 @@ class Common:
         chs = Common.to_chunks_generator(awaitable_chunks=awaitable_chunks)
         encrypt_time = T.monotonic() - t1
         chunks = Chunks(chs= chs,n =n)
-
+        executor.shutdown(wait=True)
         return (chunks, segment_time, encrypt_time)
     
     @staticmethod
@@ -2513,8 +2501,7 @@ class Common:
     @staticmethod
     def encrypt_chunk_ckks(key:str, chunk:Chunk, _round:bool, decimals:int, path:str, ctx_filename:str, pubkey_filename:str, secretkey_filename:str, relinkey_filename:str = "", rotatekey_filename:str = "")-> Chunk:
         try:
-            dataowner = DataOwnerPQC(
-                scheme= Ckks.from_pyfhel(
+            ckks = Ckks.from_pyfhel(
                     _round             = _round,
                     decimals           = decimals,
                     path               = path,
@@ -2524,10 +2511,9 @@ class Common:
                     relinkey_filename  = relinkey_filename,
                     rotatekey_filename =  rotatekey_filename 
 
-                ) 
-            )
+                )
             plaintext_matrix = chunk.to_ndarray().unwrap().copy()
-            encyrpted_chunk:List[PyCtxt] = dataowner.ckks_encrypt_matrix_chunk(plaintext_matrix = plaintext_matrix)
+            encyrpted_chunk:List[PyCtxt] = ckks.encrypt_matrix(plaintext_matrix=plaintext_matrix).data
             data = Common.from_pyctxt_list_to_bytes(xs=encyrpted_chunk)
             c= Chunk(group_id = key, index = chunk.index, data = data, chunk_id = Some("{}_{}".format(key,chunk.index)))
             return c
@@ -2539,13 +2525,11 @@ class Common:
     @staticmethod
     def encrypt_chunk_ckks_with_initialized_executor(key:str, chunk:Chunk)-> Chunk:
         try:
-            global ckks
-            global dataowner
-            if ckks is None or dataowner is None:
-                raise Exception("CKKS context or dataowner not initialized. Please run init_ckks_worker_context first.")
+            if Common.ckks is None:
+                raise Exception("CKKS context not initialized. Please run init_ckks_worker_context first.")
   
             plaintext_matrix = chunk.to_ndarray().unwrap().copy()
-            encyrpted_chunk:List[PyCtxt] = dataowner.ckks_encrypt_matrix_chunk(plaintext_matrix = plaintext_matrix)
+            encyrpted_chunk:List[PyCtxt] = Common.ckks.encrypt_matrix(plaintext_matrix=plaintext_matrix).data
             data = Common.from_pyctxt_list_to_bytes(xs=encyrpted_chunk)
             c= Chunk(group_id = key, index = chunk.index, data = data, chunk_id = Some("{}_{}".format(key,chunk.index)))
             return c
@@ -2604,8 +2588,7 @@ class Common:
         rotatekey_filename:str = ""
         )-> Chunk:
         try:
-            dataowner = DataOwnerPQC(
-                scheme= Ckks.from_pyfhel(
+            ckks = Ckks.from_pyfhel(
                     _round             = _round,
                     decimals           = decimals,
                     path               = path,
@@ -2614,10 +2597,9 @@ class Common:
                     secretkey_filename = secretkey_filename,
                     relinkey_filename  = relinkey_filename,
                     rotatekey_filename = rotatekey_filename
-                ) 
-            )
+                )
             plaintext_matrix = chunk.to_ndarray().unwrap().copy()
-            encyrpted_chunk:List[List[PyCtxt]] = dataowner.ckks_encrypt_matrix_list_chunk(plaintext_chunk = plaintext_matrix)
+            encyrpted_chunk:List[List[PyCtxt]] = ckks.encrypt_matrix_list(plaintext_matrix=plaintext_matrix)
             data = Common.from_pyctxt_matrix_to_bytes(xs=encyrpted_chunk)
             return Chunk(group_id = key, index = chunk.index, data = data, chunk_id = Some("{}_{}".format(key,chunk.index)))
         except Exception as e:

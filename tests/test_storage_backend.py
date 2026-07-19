@@ -3,11 +3,14 @@ import numpy as np
 import pandas as pd
 from uuid import uuid4
 from Pyfhel import PyCtxt
-from rorycommon import StorageBuilder, StorageBackend, StorageParams, Scheme, CkksParams, LiuParams, FdhopeParams
-from rory.core.security.pqc.dataowner import DataOwner as DataOwnerPQC
+from rorycommon import Common, StorageBuilder, StorageBackend, StorageParams, Scheme, CkksParams, LiuParams
+from rory.core.enums import Algorithm
+from rory.core.security.dataowner import DataOwner
+from rory.core.utils.utils import Utils
+from option import Ok
 
 import os
-RORY_KEYS_PATH             = os.environ.get("RORY_KEYS_PATH", "/rory/keys/test2")
+RORY_KEYS_PATH             = os.environ.get("RORY_TEST_KEYS_PATH", "/tmp/rory/keys/test2")
 RORY_COMMON_CTX_FILENAME   = os.environ.get("RORY_COMMON_CTX_FILENAME", "ctx")
 RORY_COMMON_PUBKEY_FILENAME = os.environ.get("RORY_COMMON_PUBKEY_FILENAME", "pubkey")
 RORY_COMMON_SECRETKEY_FILENAME = os.environ.get("RORY_COMMON_SECRETKEY_FILENAME", "secretkey")
@@ -67,18 +70,13 @@ def ckks_builder(client, ckks, ckks_params):
     """StorageBuilder wired for CKKS with full key config."""
     return StorageBuilder(
         storage_client = client,
-        scheme      = Scheme.CKKS,
-        ckks           = ckks,
-        ckks_params    = ckks_params,
+        scheme         = Scheme.CKKS,
+        scheme_params  = ckks_params,
     ).build()
 
 
 def liu_builder(client, liu_params):
-    return StorageBuilder(storage_client=client, scheme=Scheme.LIU, liu_params=liu_params).build()
-
-
-def fdhope_builder(client, fdhope_params):
-    return StorageBuilder(storage_client=client, scheme=Scheme.FDHOPE, fdhope_params=fdhope_params).build()
+    return StorageBuilder(storage_client=client, scheme=Scheme.LIU, scheme_params=liu_params).build()
 
 
 # ---------------------------------------------------------------------------
@@ -111,28 +109,31 @@ def test_storage_params_custom():
 # StorageBuilder — unit tests (no network)
 # ---------------------------------------------------------------------------
 
-async def test_builder_with_scheme(client, ckks):
+async def test_builder_with_scheme(client):
     backend = (
-        StorageBuilder(storage_client=client, scheme=Scheme.CKKS, ckks=ckks)
+        StorageBuilder(storage_client=client, scheme=Scheme.CKKS)
         .with_scheme(Scheme.LIU)
+        .with_scheme_params(LiuParams(seed=7))
         .build()
     )
     assert backend.scheme == Scheme.LIU
 
 
-async def test_builder_with_ckks(client, ckks):
-    backend = (
-        StorageBuilder(storage_client=client, scheme=Scheme.CKKS)
-        .with_ckks(ckks)
+async def test_builder_with_dataowner(client):
+    owner = (
+        DataOwner.with_scheme(Scheme.LIU)
+        .with_scheme_params(LiuParams(seed=7))
         .build()
     )
-    assert backend.ckks is ckks
+    backend = StorageBuilder(storage_client=client).with_dataowner(owner).build()
+    assert backend.dataowner is owner
+    assert backend.scheme == Scheme.LIU
 
 
-async def test_storage_params_applied(client, ckks):
+async def test_storage_params_applied(client):
     params = StorageParams(backoff_factor=1.5, num_chunks=4, timeout=60)
     backend = (
-        StorageBuilder(storage_client=client, scheme=Scheme.CKKS, ckks=ckks)
+        StorageBuilder(storage_client=client, scheme=Scheme.CKKS)
         .with_storage_params(params)
         .build()
     )
@@ -141,31 +142,163 @@ async def test_storage_params_applied(client, ckks):
     assert backend.params.timeout == 60
 
 
-async def test_builder_defaults_to_storage_params(client, ckks):
-    backend = StorageBuilder(storage_client=client, scheme=Scheme.CKKS, ckks=ckks).build()
+async def test_builder_defaults_to_storage_params(client):
+    backend = StorageBuilder(storage_client=client, scheme=Scheme.CKKS).build()
     assert isinstance(backend.params, StorageParams)
 
 
 async def test_builder_ckks_key_config(client, ckks, ckks_params):
     backend = ckks_builder(client, ckks, ckks_params)
-    assert backend.ckks_params.keys_path == RORY_KEYS_PATH
-    assert backend.ckks_params.ctx_filename == RORY_COMMON_CTX_FILENAME
+    assert backend.scheme_params.keys_path == RORY_KEYS_PATH
+    assert backend.scheme_params is ckks_params
 
 
-async def test_builder_with_fdhope_params(client, fdhope_params):
+async def test_builder_rejects_mixed_configuration(client):
+    owner = DataOwner.with_scheme(Scheme.LIU).build()
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        StorageBuilder(storage_client=client, dataowner=owner, scheme=Scheme.LIU).build()
+
+
+async def test_builder_dataowner_round_trip(client):
+    owner = DataOwner.with_scheme(Scheme.LIU).build()
+    backend = StorageBuilder(storage_client=client, dataowner=owner).build()
+    cloned = backend.as_builder().build()
+    assert cloned.scheme == Scheme.LIU
+    assert cloned.dataowner is owner
+
+
+@pytest.mark.asyncio
+async def test_segment_encrypt_put_uses_parallel_dataowner_pipeline(
+    client, liu_params, small_matrix, storage_ids, monkeypatch
+):
+    uploaded = {}
+
+    async def fake_put_chunks(**kwargs):
+        uploaded["chunks"] = kwargs["chunks"]
+        return Ok(True)
+
+    monkeypatch.setattr(Common, "put_chunks_no_delete", fake_put_chunks)
     backend = (
-        StorageBuilder(storage_client=client, scheme=Scheme.FDHOPE)
-        .with_fdhope_params(fdhope_params)
+        StorageBuilder(
+            storage_client=client,
+            scheme=Scheme.LIU,
+            scheme_params=liu_params,
+        )
+        .with_storage_params(StorageParams(num_chunks=2))
         .build()
     )
-    assert backend.fdhope_params is fdhope_params
+
+    result = await backend.put(
+        **storage_ids,
+        data=small_matrix,
+        segment=True,
+        encrypt=True,
+    )
+
+    assert result.is_ok, result.unwrap_err()
+    assert len(uploaded["chunks"]) == 2
 
 
-async def test_builder_fdhope_config_round_trip(client, fdhope_params):
-    backend = fdhope_builder(client, fdhope_params)
-    cloned = backend.as_builder().build()
-    assert cloned.scheme == Scheme.FDHOPE
-    assert cloned.fdhope_params == fdhope_params
+@pytest.mark.asyncio
+async def test_encrypt_without_segment_uses_one_logical_chunk(
+    client, liu_params, small_matrix, storage_ids, monkeypatch
+):
+    uploaded = {}
+
+    async def fake_put_chunks(**kwargs):
+        uploaded["chunks"] = kwargs["chunks"]
+        return Ok(True)
+
+    monkeypatch.setattr(Common, "put_chunks_no_delete", fake_put_chunks)
+    backend = StorageBuilder(
+        storage_client=client,
+        scheme=Scheme.LIU,
+        scheme_params=liu_params,
+    ).build()
+
+    result = await backend.put(**storage_ids, data=small_matrix, encrypt=True)
+
+    assert result.is_ok, result.unwrap_err()
+    assert len(uploaded["chunks"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_prepared_ckks_is_uploaded_without_reencryption(
+    client, ckks, ckks_params, small_vector, storage_ids, monkeypatch
+):
+    ciphertext = ckks.encrypt_vector(plaintext_vector=small_vector).data
+    owner = (
+        DataOwner.with_scheme(Scheme.CKKS)
+        .with_scheme_params(ckks_params)
+        .build()
+    )
+
+    def unexpected_encryption(*args, **kwargs):
+        raise AssertionError("prepared PyCtxt must not be encrypted again")
+
+    async def fake_put_chunks(**kwargs):
+        return Ok(True)
+
+    monkeypatch.setattr(owner, "outsourcedData", unexpected_encryption)
+    monkeypatch.setattr(Common, "put_chunks_no_delete", fake_put_chunks)
+    backend = StorageBuilder(storage_client=client, dataowner=owner).build()
+
+    result = await backend.put(
+        **storage_ids,
+        data=ciphertext,
+        segment=True,
+        encrypt=True,
+    )
+
+    assert result.is_ok, result.unwrap_err()
+    assert result.unwrap().encrypt_time == 0.0
+
+
+@pytest.mark.asyncio
+async def test_storage_rejects_algorithm_dataowner(client, small_matrix, storage_ids):
+    owner = (
+        DataOwner.with_algorithm(Algorithm.SKMEANS)
+        .with_scheme(Scheme.LIU)
+        .with_scheme_params(LiuParams(seed=7))
+        .build()
+    )
+    backend = StorageBuilder(storage_client=client, dataowner=owner).build()
+
+    result = await backend.put(**storage_ids, data=small_matrix, encrypt=True)
+
+    assert result.is_err
+    assert "Algorithm.NONE" in str(result.unwrap_err())
+
+
+@pytest.mark.asyncio
+async def test_storage_does_not_implement_paillier(client, small_matrix, storage_ids):
+    backend = StorageBuilder(storage_client=client, scheme=Scheme.PAILLIER).build()
+
+    result = await backend.put(**storage_ids, data=small_matrix, encrypt=True)
+
+    assert result.is_err
+    assert isinstance(result.unwrap_err(), NotImplementedError)
+
+
+@pytest.mark.asyncio
+async def test_delete_runs_before_put(client, small_matrix, storage_ids, monkeypatch):
+    calls = []
+
+    async def fake_delete(**kwargs):
+        calls.append("delete")
+
+    async def fake_put(**kwargs):
+        calls.append("put")
+        return Ok(True)
+
+    monkeypatch.setattr(Common, "while_not_delete_ball_id", fake_delete)
+    monkeypatch.setattr(Common, "put_ndarray_no_delete", fake_put)
+    backend = StorageBuilder(storage_client=client).build()
+
+    result = await backend.put(**storage_ids, data=small_matrix, delete=True)
+
+    assert result.is_ok, result.unwrap_err()
+    assert calls == ["delete", "put"]
 
 
 # ---------------------------------------------------------------------------
@@ -292,27 +425,21 @@ async def test_put_get_encrypt_liu(client, liu_params, small_matrix, storage_ids
 
 
 @pytest.mark.asyncio
-async def test_put_encrypt_fdhope(client, dataowner, fdhope_params, small_matrix, storage_ids):
-    udm = dataowner.get_U(
-        algorithm        = "DBSKMEANS",
-        plaintext_matrix = small_matrix,
-    )
-    backend = fdhope_builder(client, fdhope_params)
-    result = await backend.put(**storage_ids, data=udm, encrypt=True)
+async def test_put_prepared_udm(client, small_matrix, storage_ids):
+    udm = Utils.calculate_UDM(plaintext_matrix=small_matrix)
+    backend = StorageBuilder(storage_client=client).build()
+    result = await backend.put(**storage_ids, data=udm, segment=True)
     assert result.is_ok, result.unwrap_err()
     assert result.unwrap().shape == udm.shape
 
 
 @pytest.mark.asyncio
-async def test_put_get_encrypt_fdhope(client, dataowner, fdhope_params, small_matrix, storage_ids):
-    udm = dataowner.get_U(
-        algorithm        = "DBSKMEANS",
-        plaintext_matrix = small_matrix,
-    )
-    backend = fdhope_builder(client, fdhope_params)
-    put = await backend.put(**storage_ids, data=udm, encrypt=True)
+async def test_put_get_prepared_udm(client, small_matrix, storage_ids):
+    udm = Utils.calculate_UDM(plaintext_matrix=small_matrix)
+    backend = StorageBuilder(storage_client=client).build()
+    put = await backend.put(**storage_ids, data=udm, segment=True)
     assert put.is_ok, put.unwrap_err()
-    result = await backend.get(**storage_ids, encrypt=True)
+    result = await backend.get(**storage_ids, segment=True)
     assert result.is_ok, result.unwrap_err()
     value = result.unwrap()
     assert value.raw_value is not None
@@ -321,8 +448,8 @@ async def test_put_get_encrypt_fdhope(client, dataowner, fdhope_params, small_ma
 
 
 @pytest.mark.asyncio
-async def test_get_encrypt_fdhope_uses_get_and_merge(client, fdhope_params, monkeypatch):
-    backend = fdhope_builder(client, fdhope_params)
+async def test_get_prepared_udm_uses_get_and_merge(client, monkeypatch):
+    backend = StorageBuilder(storage_client=client).build()
     expected = np.arange(4, dtype=np.float64).reshape(2, 2)
     calls = {"get_and_merge": 0, "get_pyctxt": 0}
 
@@ -334,12 +461,12 @@ async def test_get_encrypt_fdhope_uses_get_and_merge(client, fdhope_params, monk
 
     async def fake_get_pyctxt(**kwargs):
         calls["get_pyctxt"] += 1
-        raise AssertionError("FDHOPE get should not use CKKS retrieval")
+        raise AssertionError("Prepared UDM get should not use CKKS retrieval")
 
     monkeypatch.setattr("rorycommon.Common.get_and_merge", fake_get_and_merge)
     monkeypatch.setattr("rorycommon.Common.get_pyctxt", fake_get_pyctxt)
 
-    result = await backend.get(bucket_id="bucket", ball_id="ball", encrypt=True)
+    result = await backend.get(bucket_id="bucket", ball_id="ball", segment=True)
 
     assert result.is_ok, result.unwrap_err()
     assert calls == {"get_and_merge": 1, "get_pyctxt": 0}
@@ -352,10 +479,9 @@ async def test_get_encrypt_fdhope_uses_get_and_merge(client, fdhope_params, monk
 
 @pytest.mark.asyncio
 async def test_put_tlist_ckks(client, ckks, ckks_params, small_matrix, storage_ids):
-    dataowner_pqc = DataOwnerPQC(scheme=ckks)
-    ciphertexts = dataowner_pqc.ckks_encrypt_matrix_chunk(small_matrix)
+    ciphertexts = ckks.encrypt_matrix(plaintext_matrix=small_matrix).data
     backend = ckks_builder(client, ckks, ckks_params)
-    result = await backend.put(**storage_ids, data=ciphertexts)
+    result = await backend.put(**storage_ids, data=ciphertexts, encrypt=True)
     assert result.is_ok, result.unwrap_err()
 
 
@@ -560,7 +686,7 @@ async def test_put_string_path_delete_flag(client, ckks, ckks_params, storage_id
 
 @pytest.mark.asyncio
 async def test_put_a_list_with_one_element_ckks(client, ckks, ckks_params, storage_ids):
-    backend = StorageBuilder(storage_client=client, scheme=Scheme.CKKS, ckks=ckks, ckks_params=ckks_params)\
+    backend = StorageBuilder(storage_client=client, scheme=Scheme.CKKS, scheme_params=ckks_params)\
     .with_storage_params(params=StorageParams(num_chunks=2))\
     .build()
     # ckks_builder(client, ckks, ckks_params)
@@ -571,7 +697,7 @@ async def test_put_a_list_with_one_element_ckks(client, ckks, ckks_params, stora
     assert get_result.is_ok, get_result.unwrap_err()
     value = get_result.unwrap()
     # print(value.raw_value)
-    result2 = await backend.put(**storage_ids, data=value.raw_value, delete=True, segment=True, encrypt=False)
+    result2 = await backend.put(**storage_ids, data=value.raw_value, delete=True, segment=True, encrypt=True)
     assert result2.is_ok, result2.unwrap_err()
 
 
@@ -582,7 +708,7 @@ async def test_put_a_list_with_one_element_ckks(client, ckks, ckks_params, stora
 @pytest.mark.asyncio
 async def test_put_list_int_plaintext(client, liu_params, storage_ids):
     """List[int] is accepted and stored as a float64 plaintext blob."""
-    backend = StorageBuilder(storage_client=client, scheme=Scheme.LIU, liu_params=liu_params).build()
+    backend = StorageBuilder(storage_client=client).build()
     data = [1, 2, 3, 4, 5]
     result = await backend.put(**storage_ids, data=data)
     assert result.is_ok, result.unwrap_err()
@@ -592,7 +718,7 @@ async def test_put_list_int_plaintext(client, liu_params, storage_ids):
 @pytest.mark.asyncio
 async def test_put_list_float_plaintext(client, liu_params, storage_ids):
     """List[float] is accepted and stored as a float64 plaintext blob."""
-    backend = StorageBuilder(storage_client=client, scheme=Scheme.LIU, liu_params=liu_params).build()
+    backend = StorageBuilder(storage_client=client, scheme=Scheme.LIU, scheme_params=liu_params).build()
     data = [0.1, 0.2, 0.3, 0.4]
     result = await backend.put(**storage_ids, data=data)
     assert result.is_ok, result.unwrap_err()
@@ -602,7 +728,7 @@ async def test_put_list_float_plaintext(client, liu_params, storage_ids):
 @pytest.mark.asyncio
 async def test_put_list_mixed_int_float_plaintext(client, liu_params, storage_ids):
     """A mixed List[int | float] is cast to float64."""
-    backend = StorageBuilder(storage_client=client, scheme=Scheme.LIU, liu_params=liu_params).build()
+    backend = StorageBuilder(storage_client=client, scheme=Scheme.LIU, scheme_params=liu_params).build()
     data = [1, 2.5, 3, 4.0]
     result = await backend.put(**storage_ids, data=data)
     assert result.is_ok, result.unwrap_err()
@@ -612,7 +738,7 @@ async def test_put_list_mixed_int_float_plaintext(client, liu_params, storage_id
 @pytest.mark.asyncio
 async def test_put_list_empty_returns_err(client, liu_params, storage_ids):
     """An empty list returns Err, not an exception."""
-    backend = StorageBuilder(storage_client=client, scheme=Scheme.LIU, liu_params=liu_params).build()
+    backend = StorageBuilder(storage_client=client, scheme=Scheme.LIU, scheme_params=liu_params).build()
     result = await backend.put(**storage_ids, data=[])
     assert result.is_err
 
@@ -620,7 +746,7 @@ async def test_put_list_empty_returns_err(client, liu_params, storage_ids):
 @pytest.mark.asyncio
 async def test_put_get_list_float_round_trip(client, liu_params, storage_ids):
     """Round-trip: List[float] put then get returns the same values."""
-    backend = StorageBuilder(storage_client=client, scheme=Scheme.LIU, liu_params=liu_params).build()
+    backend = StorageBuilder(storage_client=client, scheme=Scheme.LIU, scheme_params=liu_params).build()
     data = [1.0, 2.0, 3.0, 4.0, 5.0]
     result = await backend.put(**storage_ids, data=data)
     assert result.is_ok, result.unwrap_err()
@@ -661,16 +787,16 @@ async def test_put_list_int_encrypt_ckks(client, ckks, ckks_params, storage_ids)
 # ---------------------------------------------------------------------------
 
 def test_builder_no_scheme(client):
-    """StorageBuilder with no scheme builds successfully; backend.scheme is None."""
+    """StorageBuilder with no scheme uses Rory's explicit NONE value."""
     backend = StorageBuilder(storage_client=client).build()
-    assert backend.scheme is None
+    assert backend.scheme == Scheme.NONE
 
 
 def test_builder_no_scheme_round_trip(client):
-    """as_builder() preserves scheme=None through a round-trip."""
+    """as_builder() preserves Scheme.NONE through a round-trip."""
     backend = StorageBuilder(storage_client=client).build()
     cloned = backend.as_builder().build()
-    assert cloned.scheme is None
+    assert cloned.scheme == Scheme.NONE
 
 
 # ---------------------------------------------------------------------------
@@ -721,13 +847,10 @@ async def test_put_get_no_scheme_segment(client, small_matrix, storage_ids):
 
 
 @pytest.mark.asyncio
-async def test_put_get_skmeans_liu_udm(client, liu_params,dataowner, small_matrix, storage_ids):
+async def test_put_get_skmeans_liu_udm(client, liu_params, small_matrix, storage_ids):
     """Test put/get of a Liu UDM object."""
-    backend = StorageBuilder(storage_client=client, scheme=Scheme.LIU, liu_params=liu_params).build()
-    udm = dataowner.get_U(
-        algorithm        = "SKMEANS",
-        plaintext_matrix = small_matrix,
-    )
+    backend = StorageBuilder(storage_client=client, scheme=Scheme.LIU, scheme_params=liu_params).build()
+    udm = Utils.calculate_UDM(plaintext_matrix=small_matrix)
     print(udm.shape)
     result = await backend.put(
         bucket_id = storage_ids['bucket_id'],
@@ -748,21 +871,17 @@ async def test_put_get_skmeans_liu_udm(client, liu_params,dataowner, small_matri
     assert result.is_ok, f"Error: {result.unwrap_err()}"
 
 @pytest.mark.asyncio
-async def test_put_get_dbskmeans_udm(client, fdhope_params, dataowner, small_matrix, storage_ids):
+async def test_put_get_dbskmeans_udm(client, small_matrix, storage_ids):
     """Test put/get of a FDHOPE UDM object."""
-    backend = StorageBuilder(storage_client=client, scheme=Scheme.FDHOPE, fdhope_params=fdhope_params).build()
-    algorithm = "DBSKMEANS"
-    udm = dataowner.get_U(
-        algorithm        = algorithm,
-        plaintext_matrix = small_matrix,
-    )
+    backend = StorageBuilder(storage_client=client).build()
+    udm = Utils.calculate_UDM(plaintext_matrix=small_matrix)
     print(udm.shape)
     result = await backend.put(
         bucket_id = storage_ids['bucket_id'],
         ball_id   = storage_ids['ball_id'],
         data      = udm,
         delete    = True,
-        encrypt   = True,
+        encrypt   = False,
         segment   = True,
         tags={}
     )
@@ -770,7 +889,7 @@ async def test_put_get_dbskmeans_udm(client, fdhope_params, dataowner, small_mat
     result = await backend.get(
         bucket_id = storage_ids['bucket_id'],
         ball_id   = storage_ids['ball_id'],
-        encrypt   = True,
+        encrypt   = False,
         segment   = True,
     )
     assert result.is_ok, f"Error: {result.unwrap_err()}"

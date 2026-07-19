@@ -4,8 +4,9 @@ import pytest
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor
 from rory.core.security.dataowner import DataOwner
-from rory.core.security.pqc.dataowner import DataOwner as DataOwnerPQC
-from rory.core.security.cryptosystem.liu import Liu
+from rory.core.enums.schemes import Scheme as RoryScheme
+from rory.core.security.scheme_params import CkksParams as RoryCkksParams
+from rory.core.security.scheme_params import LiuParams as RoryLiuParams
 from rory.core.security.cryptosystem.pqc.ckks import Ckks,CkksModes
 from uuid import uuid4
 from dotenv import load_dotenv
@@ -15,12 +16,12 @@ if os.path.exists(RORY_COMMON_ENV_FILE_PATH):
     load_dotenv(dotenv_path=RORY_COMMON_ENV_FILE_PATH)
 
 from mictlanx import AsyncClient
-from rorycommon import Common as RoryCommon, CkksParams, LiuParams, FdhopeParams
+from rorycommon import Common as RoryCommon, CkksParams, LiuParams
 
 
 
 RORY_MAX_WORKERS                            = int(os.environ.get("RORY_MAX_WORKERS","2"))
-RORY_KEYS_PATH                              = os.environ.get("RORY_KEYS_PATH", "/rory/keys/test2")
+RORY_KEYS_PATH                              = os.environ.get("RORY_TEST_KEYS_PATH", "/tmp/rory/keys/test2")
 RORY_COMMON_CTX_FILENAME                    = os.environ.get("RORY_COMMON_CTX_FILENAME","ctx")
 RORY_COMMON_PUBKEY_FILENAME                 = os.environ.get("RORY_COMMON_PUBKEY_FILENAME","pubkey")
 RORY_COMMON_SECRETKEY_FILENAME              = os.environ.get("RORY_COMMON_SECRETKEY_FILENAME","secretkey")
@@ -87,7 +88,7 @@ async def client():
     )
     yield client
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def ckks():
     if not os.path.exists(RORY_KEYS_PATH):
         os.makedirs(RORY_KEYS_PATH,exist_ok=True)
@@ -111,38 +112,41 @@ def ckks():
     return ckks
 @pytest.fixture
 def dataowner_pqc(ckks):
-    dataowner_pqc = DataOwnerPQC(
-        scheme        = ckks,
-        securitylevel = RORY_COMMON_CKKS_SECURITY_LEVEL
+    return (
+        DataOwner.with_scheme(RoryScheme.CKKS)
+        .with_scheme_params(
+            RoryCkksParams(
+                keys_path      = RORY_KEYS_PATH,
+                decimals       = RORY_COMMON_CKKS_DECIMALS,
+                security_level = RORY_COMMON_CKKS_SECURITY_LEVEL,
+            )
+        )
+        .build()
     )
-    return dataowner_pqc
 
 @pytest.fixture
 def dataowner():
-    dataowner = DataOwner(
-        liu_scheme= Liu(
-            _round         = True,
-            decimals       = RORY_COMMON_CKKS_DECIMALS,
-            secure_random  = False,
-            seed           = 1,
-            use_np_random  = True,
-            security_level = 128
-        ),
+    return (
+        DataOwner.with_scheme(RoryScheme.LIU)
+        .with_scheme_params(
+            RoryLiuParams(
+                _round         = True,
+                decimals       = RORY_COMMON_CKKS_DECIMALS,
+                secure_random  = False,
+                seed           = 1,
+                use_np_random  = True,
+                security_level = 128,
+            )
+        )
+        .build()
     )
-    return dataowner
 
 @pytest.fixture
 def ckks_params():
     return CkksParams(
-        keys_path          = RORY_KEYS_PATH,
-        ctx_filename       = RORY_COMMON_CTX_FILENAME,
-        pubkey_filename    = RORY_COMMON_PUBKEY_FILENAME,
-        secretkey_filename = RORY_COMMON_SECRETKEY_FILENAME,
-        relinkey_filename  = RORY_COMMON_RELINKEY_FILENAME,
-        rotatekey_filename = RORY_COMMON_ROTATEKEY_FILENAME,
-        decimals           = RORY_COMMON_CKKS_DECIMALS,
-        _round             = True,
-
+        keys_path      = RORY_KEYS_PATH,
+        decimals       = RORY_COMMON_CKKS_DECIMALS,
+        security_level = RORY_COMMON_CKKS_SECURITY_LEVEL,
     )
 
 @pytest.fixture
@@ -155,23 +159,6 @@ def liu_params():
         use_np_random  = True,
         security_level = 128,
     )
-
-
-@pytest.fixture
-def fdhope_params():
-    return FdhopeParams(
-        scheme         = "DBSKMEANS",
-        sens           = 0.2,
-        _round         = True,
-        decimals       = RORY_COMMON_CKKS_DECIMALS,
-        secure_random  = False,
-        seed           = 1,
-        use_np_random  = True,
-        security_level = 128,
-    )
-
-
-
 
 @pytest.fixture
 def key():
@@ -199,4 +186,7 @@ def initialized_executor():
         initializer = RoryCommon.init_ckks_worker_context,
         initargs= (RORY_KEYS_PATH, RORY_COMMON_CTX_FILENAME, RORY_COMMON_PUBKEY_FILENAME, RORY_COMMON_SECRETKEY_FILENAME)
     )
-    yield executor
+    try:
+        yield executor
+    finally:
+        executor.shutdown(wait=True)

@@ -7,6 +7,8 @@ from mictlanx.utils.segmentation import Chunks
 from rorycommon import Common as RoryCommon, LiuParams
 from concurrent.futures import ProcessPoolExecutor
 from rory.core.security.dataowner import DataOwner
+from rory.core.security.cryptosystem.fdhope import Fdhope
+from rory.core.utils.utils import Utils
 
 
 @pytest.mark.asyncio
@@ -19,7 +21,7 @@ async def test_liu(
 ):
     RORY_MAX_WORKERS = get_context["max_workers"]
 
-    n   = generated_matrix.shape[0]*generated_matrix.shape[1]*dataowner.m
+    n   = generated_matrix.size
     with warnings.catch_warnings(record=True):
         warnings.simplefilter("always")
         emt = RoryCommon.segment_and_encrypt_liu_with_executor(
@@ -42,7 +44,7 @@ def test_liu_with_executor_timed_returns_tuple(
     get_context: dict,
 ):
     RORY_MAX_WORKERS = get_context["max_workers"]
-    n = generated_matrix.shape[0] * generated_matrix.shape[1] * dataowner.m
+    n = generated_matrix.size
 
     result = RoryCommon.segment_and_encrypt_liu_with_executor_timed(
         executor         = executor,
@@ -68,7 +70,7 @@ def test_liu_timed_returns_tuple(
     get_context: dict,
 ):
     RORY_MAX_WORKERS = get_context["max_workers"]
-    n = generated_matrix.shape[0] * generated_matrix.shape[1] * dataowner.m
+    n = generated_matrix.size
 
     result = RoryCommon.segment_and_encrypt_liu_timed(
         key              = key,
@@ -95,7 +97,7 @@ def test_liu_deprecated_warns(
     get_context: dict,
 ):
     RORY_MAX_WORKERS = get_context["max_workers"]
-    n = generated_matrix.shape[0] * generated_matrix.shape[1] * dataowner.m
+    n = generated_matrix.size
 
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
@@ -120,7 +122,7 @@ def test_liu_no_executor_deprecated_warns(
     get_context: dict,
 ):
     RORY_MAX_WORKERS = get_context["max_workers"]
-    n = generated_matrix.shape[0] * generated_matrix.shape[1] * dataowner.m
+    n = generated_matrix.size
 
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
@@ -205,7 +207,6 @@ def test_liu_initialized_executor_encrypt_chunk_raises_without_init():
 @pytest.mark.asyncio
 async def test_fdhope(
     generated_matrix:np.ndarray,
-    dataowner:DataOwner,
     key:str,
     executor:ProcessPoolExecutor,
     get_context:dict
@@ -215,16 +216,15 @@ async def test_fdhope(
     n          = generated_matrix.shape[1]*generated_matrix.shape[1]*generated_matrix.shape[0]
     sens       = 0.2
     scheme  = "DBSKMEANS"
-    udm        = dataowner.get_U(
-        algorithm     = scheme,
-        plaintext_matrix = generated_matrix
-    )
+    udm = Utils.calculate_UDM(plaintext_matrix=generated_matrix)
+    fdhope = Fdhope()
+    fdhope.generate_keys(dataset=udm)
     # print(udm)
     emt = RoryCommon.segment_and_encrypt_fdhope_with_executor(
         executor         = executor,
         scheme        = scheme,
         key              = key,
-        dataowner        = dataowner,
+        dataowner        = fdhope,
         matrix           = udm,
         n                = n,
         num_chunks       = RORY_MAX_WORKERS,
