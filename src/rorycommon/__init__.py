@@ -11,7 +11,6 @@ import pandas as pd
 import os
 from typing import Self, Tuple, Generator, Dict, AsyncGenerator, Optional, Union, List, Awaitable,Any
 from dataclasses import dataclass, field, replace
-from rory.core.enums.algorithms import Algorithm
 from rory.core.enums.schemes import Scheme
 from rory.core.security.dataowner import DataOwner
 from rory.core.security.scheme_params import (
@@ -111,15 +110,18 @@ class StorageParams:
     """Tuning parameters applied to every `put()` / `get()` call on the backend. Pass a custom instance to `StorageBuilder.__init__` or `.with_storage_params()`.
 
     Attributes:
-        backoff_factor: Multiplier applied to ``delay`` on each retry.
+        backoff_factor: Multiplier applied to ``delay`` after each failed
+            filesystem read and forwarded to cloud storage operations.
         num_chunks: Number of segments to split data into when uploading in chunks.
         chunk_index: Starting chunk index for partial retrievals.
         chunk_size: Target size per downloaded chunk (e.g. ``"256kb"``).
-        delay: Base delay in seconds between retries.
+        delay: Base delay in seconds between filesystem read retries and the
+            delay forwarded to cloud storage operations.
         force: Pass ``force=True`` to the underlying mictlanx client.
         headers: Extra HTTP headers forwarded on every request.
         http2: Use HTTP/2 for the underlying transport.
-        max_attempts: Maximum number of retry attempts before giving up.
+        max_attempts: Maximum number of filesystem read attempts before giving
+            up and the retry limit forwarded to cloud storage operations.
         max_parallel_gets: Maximum concurrent chunk downloads.
         timeout: Request timeout in seconds.
     """
@@ -395,7 +397,7 @@ class StorageBackend:
             max_retries=self.params.max_attempts,
         )
 
-    async def _get_from_filesystem(
+    async def _get_from_filesystem_once(
         self,
         bucket_id: str,
         ball_id: str,
@@ -439,6 +441,36 @@ class StorageBackend:
             read_time=T.monotonic() - started,
             dtype=dtype,
         )
+
+    async def _get_from_filesystem(
+        self,
+        bucket_id: str,
+        ball_id: str,
+        *,
+        segment: bool,
+        encrypt: bool,
+    ) -> GetResult:
+        started = T.monotonic()
+        max_attempts = max(1, self.params.max_attempts)
+        retry_delay = self.params.delay
+
+        for attempt in range(max_attempts):
+            try:
+                result = await self._get_from_filesystem_once(
+                    bucket_id,
+                    ball_id,
+                    segment=segment,
+                    encrypt=encrypt,
+                )
+                result.read_time = T.monotonic() - started
+                return result
+            except Exception:
+                if attempt + 1 == max_attempts:
+                    raise
+                await asyncio.sleep(retry_delay)
+                retry_delay *= self.params.backoff_factor
+
+        raise RuntimeError("Filesystem read retry loop completed without a result")
 
     def as_builder(self) -> StorageBuilder:
         """Return a ``StorageBuilder`` pre-populated with this backend's configuration.
@@ -504,8 +536,8 @@ class StorageBackend:
         | ``List[int]`` / ``List[float]`` | any | any | — | any | auto-converted to 1-D ``float64`` ndarray, then follows the ndarray rows below |
         | ``PyCtxt`` / sequence of ``PyCtxt`` | ``True`` | any | — | CKKS | detect prepared ciphertexts, serialize without re-encrypting |
         | ``Chunks`` | ``False`` | — | — | any | ``put_chunks`` directly |
-        | ``ndarray`` | ``True`` | ``False`` | any | CKKS / LIU | encrypt through DataOwner as one logical chunk |
-        | ``ndarray`` | ``True`` | ``True`` | any | CKKS / LIU | segment, encrypt chunks in parallel through DataOwner |
+        | ``ndarray`` | ``True`` | ``False`` | any | CKKS / LIU | encrypt through the DataOwner's primary scheme as one logical chunk |
+        | ``ndarray`` | ``True`` | ``True`` | any | CKKS / LIU | segment and encrypt chunks in parallel through the DataOwner's primary scheme |
         | ``ndarray`` | ``False`` | ``True`` | any | any | ``Chunks.from_ndarray`` → ``put_chunks`` |
         | ``ndarray`` | ``False`` | ``False`` | any | any | single blob via ``put_ndarray`` |
 
@@ -520,9 +552,9 @@ class StorageBackend:
             tags: Arbitrary key/value metadata stored alongside the object.
             segment: Split into ``params.num_chunks`` chunks. With encryption enabled,
                 each chunk is encrypted in parallel; without it, chunks remain plaintext.
-            encrypt: Encrypt numeric input through the configured scheme-only DataOwner.
-                An algorithm-configured DataOwner must first process the complete dataset;
-                store its selected output artifact as prepared data instead.
+            encrypt: Encrypt numeric input through the configured DataOwner's
+                primary scheme. Storage does not execute algorithm recipes or
+                generate artifacts such as UDM/DM.
             delete: Delete any existing object at ``ball_id`` before uploading.
                 Safe to use even if the key does not exist yet.
 
@@ -619,12 +651,6 @@ class StorageBackend:
 
             if isinstance(data, np.ndarray) and encrypt:
                 owner = self._require_dataowner()
-                if owner.algorithm != Algorithm.NONE:
-                    return Err(ValueError(
-                        "Parallel storage encryption requires a scheme-only DataOwner "
-                        "(Algorithm.NONE). Run outsourcedData() on the full dataset and "
-                        "store the selected result artifact instead."
-                    ))
                 if owner.scheme == Scheme.PAILLIER:
                     return Err(NotImplementedError("Paillier storage is not supported"))
 
@@ -938,7 +964,15 @@ class Common:
     @staticmethod
     def _encrypt_dataowner_chunk(dataowner: DataOwner, key: str, chunk: Chunk) -> Chunk:
         plaintext = chunk.to_ndarray().unwrap()
-        encrypted = dataowner.outsourcedData(plaintext).encrypted_matrix
+        dataowner.initialize()
+        if plaintext.ndim == 1:
+            encrypted = dataowner.primary_scheme.encrypt_vector(
+                plaintext_vector=plaintext
+            ).data
+        else:
+            encrypted = dataowner.primary_scheme.encrypt_matrix(
+                plaintext_matrix=plaintext
+            ).data
         if dataowner.scheme == Scheme.CKKS:
             ciphertexts = list(np.asarray(encrypted, dtype=object).reshape(-1))
             return Chunk(
@@ -985,9 +1019,7 @@ class Common:
         dataowner: DataOwner,
         num_chunks: int,
     ) -> Tuple[Chunks, float, float]:
-        """Segment plaintext and encrypt every segment through Rory DataOwner."""
-        if dataowner.algorithm != Algorithm.NONE:
-            raise ValueError("Segment encryption requires Algorithm.NONE")
+        """Segment plaintext and encrypt every segment with the owner's scheme."""
         if dataowner.scheme not in {Scheme.CKKS, Scheme.LIU}:
             raise ValueError(f"Unsupported storage encryption scheme: {dataowner.scheme.value}")
         if num_chunks < 1:

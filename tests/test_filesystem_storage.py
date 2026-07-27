@@ -9,10 +9,17 @@ from rory.core.security.dataowner import DataOwner
 from rorycommon import LiuParams, Scheme, SourceType, StorageBuilder, StorageParams
 
 
-def filesystem_backend(tmp_path: Path, *, num_chunks: int = 2):
+def filesystem_backend(
+    tmp_path: Path,
+    *,
+    num_chunks: int = 2,
+    **storage_params,
+):
     return (
         StorageBuilder(storage_path=str(tmp_path))
-        .with_storage_params(StorageParams(num_chunks=num_chunks))
+        .with_storage_params(
+            StorageParams(num_chunks=num_chunks, **storage_params)
+        )
         .build()
     )
 
@@ -62,7 +69,7 @@ async def test_segmented_plaintext_round_trip(tmp_path):
 
 @pytest.mark.asyncio
 async def test_get_rejects_incorrect_flags(tmp_path):
-    backend = filesystem_backend(tmp_path)
+    backend = filesystem_backend(tmp_path, max_attempts=1)
     matrix = np.ones((4, 2))
     assert (await backend.put("analytics", "flags", matrix, segment=True)).is_ok
 
@@ -74,7 +81,7 @@ async def test_get_rejects_incorrect_flags(tmp_path):
 
 @pytest.mark.asyncio
 async def test_missing_ball_returns_file_not_found(tmp_path):
-    backend = filesystem_backend(tmp_path)
+    backend = filesystem_backend(tmp_path, max_attempts=1)
 
     result = await backend.get("analytics", "missing")
 
@@ -129,7 +136,7 @@ async def test_delete_removes_ball_before_replacement(tmp_path):
 
 @pytest.mark.asyncio
 async def test_checksum_corruption_returns_error(tmp_path):
-    backend = filesystem_backend(tmp_path)
+    backend = filesystem_backend(tmp_path, max_attempts=1)
     matrix = np.arange(4).reshape(2, 2)
     assert (await backend.put("analytics", "corrupt", matrix)).is_ok
     object_path = tmp_path / "analytics" / "corrupt"
@@ -141,6 +148,145 @@ async def test_checksum_corruption_returns_error(tmp_path):
 
     assert result.is_err
     assert "Checksum mismatch" in str(result.unwrap_err())
+
+
+@pytest.mark.asyncio
+async def test_filesystem_get_retries_until_success(tmp_path, monkeypatch):
+    backend = filesystem_backend(
+        tmp_path,
+        max_attempts=5,
+        delay=0,
+        backoff_factor=0.5,
+    )
+    matrix = np.arange(6).reshape(3, 2)
+    assert (await backend.put("analytics", "retry", matrix)).is_ok
+
+    get_object = backend.filesystem.get_object
+    attempts = 0
+
+    async def transient_failure(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise OSError(f"transient read failure {attempts}")
+        return await get_object(*args, **kwargs)
+
+    monkeypatch.setattr(backend.filesystem, "get_object", transient_failure)
+
+    result = await backend.get("analytics", "retry")
+
+    assert result.is_ok, result.unwrap_err()
+    assert attempts == 3
+    np.testing.assert_array_equal(result.unwrap().raw_value, matrix)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_get_retries_every_exception_with_backoff(
+    tmp_path,
+    monkeypatch,
+):
+    backend = filesystem_backend(
+        tmp_path,
+        max_attempts=4,
+        delay=2,
+        backoff_factor=0.5,
+    )
+    attempts = 0
+    delays = []
+
+    async def persistent_failure(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise ValueError(f"read failure {attempts}")
+
+    async def record_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(backend.filesystem, "get_object", persistent_failure)
+    monkeypatch.setattr("rorycommon.asyncio.sleep", record_sleep)
+
+    result = await backend.get("analytics", "retry")
+
+    assert result.is_err
+    assert str(result.unwrap_err()) == "read failure 4"
+    assert attempts == 4
+    assert delays == [2, 1.0, 0.5]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_error"),
+    [
+        ("flags", "Storage flags do not match"),
+        ("checksum", "Checksum mismatch"),
+    ],
+)
+async def test_filesystem_get_retries_validation_failures(
+    tmp_path,
+    monkeypatch,
+    failure_kind,
+    expected_error,
+):
+    backend = filesystem_backend(tmp_path, max_attempts=3, delay=0)
+    matrix = np.arange(6).reshape(3, 2)
+    segment = failure_kind == "flags"
+    assert (
+        await backend.put("analytics", failure_kind, matrix, segment=segment)
+    ).is_ok
+
+    if failure_kind == "checksum":
+        object_path = tmp_path / "analytics" / failure_kind
+        manifest = json.loads((object_path / "manifest.json").read_text())
+        payload = (
+            object_path
+            / "generations"
+            / manifest["generation"]
+            / "payload.bin"
+        )
+        payload.write_bytes(b"corrupt")
+
+    get_object = backend.filesystem.get_object
+    attempts = 0
+
+    async def count_attempts(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        return await get_object(*args, **kwargs)
+
+    monkeypatch.setattr(backend.filesystem, "get_object", count_attempts)
+
+    result = await backend.get("analytics", failure_kind)
+
+    assert result.is_err
+    assert expected_error in str(result.unwrap_err())
+    assert attempts == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_attempts", [0, 1])
+async def test_filesystem_get_attempts_at_least_once(
+    tmp_path,
+    monkeypatch,
+    max_attempts,
+):
+    backend = filesystem_backend(
+        tmp_path,
+        max_attempts=max_attempts,
+        delay=0,
+    )
+    attempts = 0
+
+    async def persistent_failure(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("read failed")
+
+    monkeypatch.setattr(backend.filesystem, "get_object", persistent_failure)
+
+    result = await backend.get("analytics", "retry")
+
+    assert result.is_err
+    assert attempts == 1
 
 
 @pytest.mark.asyncio

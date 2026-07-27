@@ -134,9 +134,11 @@ owner = (
 backend = StorageBuilder(storage_client=client, dataowner=owner).build()
 ```
 
-For direct storage encryption, that owner must be scheme-only (`Algorithm.NONE`).
-Algorithm-configured owners must run `outsourcedData()` once on the complete dataset;
-then store the chosen prepared artifact without asking storage to repeat encryption.
+For direct storage encryption, the owner may be scheme-only or algorithm-configured.
+Storage uses only its primary Liu/CKKS scheme; it does not execute the algorithm
+recipe or generate UDM/DM while encrypting chunks. Run `outsourcedData()` on the
+complete dataset when those algorithm artifacts are required, then store the chosen
+prepared artifact.
 
 ```python
 prepared = algorithm_owner.outsourcedData(matrix)

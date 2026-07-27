@@ -291,7 +291,7 @@ async def test_full_skmeans_pqc(executor,dataowner_pqc, client,generated_matrix,
     )
     
 
-    skmeans = SkmeansPQC(he_object=ckks.he_object, init_shiftmatrix=init_shiftmatrix)
+    skmeans = SkmeansPQC(scheme=ckks, init_shiftmatrix=init_shiftmatrix)
     _encryptedMatrix = await RoryCommon.get_pyctxt(
         client    = client,
         bucket_id = MICTLANX_BUCKET_ID,
@@ -306,13 +306,13 @@ async def test_full_skmeans_pqc(executor,dataowner_pqc, client,generated_matrix,
 
 
 
-    S1,_Cent_i,_Cent_j, label_vector  = skmeans.run1(
-        status= Constants.ClusteringStatus.WORK_IN_PROGRESS, 
-        k = k, 
-        encryptedMatrix= _encryptedMatrix, 
-        Cent_j=init_shiftmatrix,
+    S1,_Cent_i,_Cent_j, label_vector = skmeans.execute_encrypted_phase(
+        status=Constants.ClusteringStatus.WORK_IN_PROGRESS,
+        k=k,
+        encrypted_matrix=_encryptedMatrix,
+        centroids=init_shiftmatrix,
         num_attributes=plaintext_matrix.shape[1],
-        UDM=_udm,
+        udm=_udm,
     ).unwrap()
 
     encrypted_shift_matrix_chunks = RoryCommon.from_pyctxts_to_chunks(key=encrypted_shift_matrix_id, xs = S1,num_chunks=RORY_MAX_WORKERS).unwrap()

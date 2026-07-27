@@ -255,7 +255,19 @@ async def test_prepared_ckks_is_uploaded_without_reencryption(
 
 
 @pytest.mark.asyncio
-async def test_storage_rejects_algorithm_dataowner(client, small_matrix, storage_ids):
+async def test_storage_uses_algorithm_dataowner_scheme_only(
+    client,
+    small_matrix,
+    storage_ids,
+    monkeypatch,
+):
+    uploaded = {}
+
+    async def fake_put_chunks(**kwargs):
+        uploaded["chunks"] = kwargs["chunks"]
+        return Ok(True)
+
+    monkeypatch.setattr(Common, "put_chunks_no_delete", fake_put_chunks)
     owner = (
         DataOwner.with_algorithm(Algorithm.SKMEANS)
         .with_scheme(Scheme.LIU)
@@ -266,8 +278,13 @@ async def test_storage_rejects_algorithm_dataowner(client, small_matrix, storage
 
     result = await backend.put(**storage_ids, data=small_matrix, encrypt=True)
 
-    assert result.is_err
-    assert "Algorithm.NONE" in str(result.unwrap_err())
+    assert result.is_ok, result.unwrap_err()
+    encrypted = np.concatenate(
+        [chunk.to_ndarray().unwrap() for chunk in uploaded["chunks"]],
+        axis=0,
+    )
+    decrypted = owner.primary_scheme.decrypt_matrix(encrypted).data
+    np.testing.assert_allclose(decrypted, small_matrix, atol=1e-12)
 
 
 @pytest.mark.asyncio
@@ -593,9 +610,14 @@ async def test_put_from_file_delete_flag(client, ckks, ckks_params, storage_ids,
     assert result.is_ok, result.unwrap_err()
 
 @pytest.mark.asyncio
-async def test_01(client,ckks,ckks_params,storage_ids,small_vector):
+async def test_segmented_ckks_vector_prepared_ciphertext_round_trip(
+    client,
+    ckks,
+    ckks_params,
+    storage_ids,
+    small_vector,
+):
     backend = ckks_builder(client, ckks, ckks_params)
-    # Delete + Segment + Encrypt + Put
     result = await backend.put(
         bucket_id = storage_ids["bucket_id"],
         ball_id   = storage_ids["ball_id"],
@@ -605,31 +627,34 @@ async def test_01(client,ckks,ckks_params,storage_ids,small_vector):
         delete    = True
     )
     assert result.is_ok, result.unwrap_err()
-    # Get the encrypted data
+
     result = await backend.get(
         bucket_id = storage_ids["bucket_id"],
         ball_id   = storage_ids["ball_id"],
-        encrypt   = True
+        encrypt   = True,
+        segment   = True,
     )
-    assert result.is_ok, result.unwrap_err()    
-    x = result.unwrap()
-    raw_value = x.raw_value 
-    assert len(raw_value) == len(small_vector)
-    # from rorycommon import Common
-    import time as T
-    dx = ckks.decrypt_list(raw_value,take=1)
-  
-    # Delete + Segment + Put
+    assert result.is_ok, result.unwrap_err()
+    raw_value = result.unwrap().raw_value
+    expected_segments = np.array_split(small_vector, backend.params.num_chunks)
+    assert len(raw_value) == len(expected_segments)
+    assert all(isinstance(value, PyCtxt) for value in raw_value)
+    decrypted = np.concatenate([
+        ckks.decrypt_list([ciphertext], take=len(expected))[0]
+        for ciphertext, expected in zip(raw_value, expected_segments)
+    ])
+    np.testing.assert_allclose(decrypted, small_vector, atol=1e-2)
+
     result = await backend.put(
         bucket_id = storage_ids["bucket_id"],
         ball_id   = storage_ids["ball_id"],
         data      = raw_value,
         delete    = True,
         segment   = True,
-        encrypt   = False
+        encrypt   = True,
     )
     assert result.is_ok, result.unwrap_err()
-    # Get the encrypted, segmented data
+
     result = await backend.get(
         bucket_id = storage_ids["bucket_id"],
         ball_id   = storage_ids["ball_id"],
@@ -638,13 +663,13 @@ async def test_01(client,ckks,ckks_params,storage_ids,small_vector):
     )
     assert result.is_ok, result.unwrap_err()
     raw_value2 = result.unwrap().raw_value
-    dx1 = ckks.decrypt_list(raw_value2,take=1)
-    assert len(raw_value2) == len(small_vector) 
-    assert all(isinstance(x, PyCtxt) for x in raw_value2)
     assert len(raw_value) == len(raw_value2)
-    assert all(abs(x[0] - x[0]) < 1e-5 for x in zip(dx, dx1))
-    # print(dx)
-    # print(dx1)
+    assert all(isinstance(value, PyCtxt) for value in raw_value2)
+    decrypted2 = np.concatenate([
+        ckks.decrypt_list([ciphertext], take=len(expected))[0]
+        for ciphertext, expected in zip(raw_value2, expected_segments)
+    ])
+    np.testing.assert_allclose(decrypted2, small_vector, atol=1e-2)
 
 # ---------------------------------------------------------------------------
 # put with string path — auto-delegates to put_from_file
@@ -762,7 +787,7 @@ async def test_put_list_int_segment(client, liu_params, storage_ids):
     backend = StorageBuilder(
         storage_client = client,
         scheme         = Scheme.LIU,
-        liu_params     = liu_params,
+        scheme_params  = liu_params,
     ).with_storage_params(StorageParams(num_chunks=2)).build()
     data = [10, 20, 30, 40, 50, 60, 70, 80]
     result = await backend.put(**storage_ids, data=data, segment=True)

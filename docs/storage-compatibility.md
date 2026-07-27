@@ -46,8 +46,9 @@ before uploading the replacement.
 
 ## DataOwner configuration
 
-For direct storage encryption, use a scheme-only owner (`Algorithm.NONE`). It can be
-provided directly:
+For direct storage encryption, provide either a scheme-only or algorithm-configured
+owner. Storage uses only its primary Liu/CKKS scheme and does not execute algorithm
+recipes while encrypting chunks:
 
 ```python
 from rory.core.security.dataowner import DataOwner
@@ -83,15 +84,15 @@ backend = (
 | Liu | Numeric vector/matrix | merged `np.ndarray` | Workers share the key but reseed their random generators independently |
 | Paillier | — | — | Storage integration is intentionally not implemented |
 
-Composite algorithm schemes remain Rory concerns. The backend does not reproduce
-their UDM/DM or FDHOPE recipes chunk-by-chunk, because those recipes require the
-complete dataset.
+Algorithm recipes remain Rory concerns. The backend uses the owner's primary
+encryption scheme but does not reproduce UDM/DM or FDHOPE recipe steps
+chunk-by-chunk, because those artifacts require the complete dataset.
 
 ## Algorithm-prepared data
 
-An algorithm-configured `DataOwner` must process the entire dataset once. Select the
-artifact required by the remote algorithm and store that prepared value without a
-second encryption pass:
+When algorithm artifacts are required, process the entire dataset once with the
+algorithm-configured `DataOwner`. Select the artifact required by the remote
+algorithm and store that prepared value without a second encryption pass:
 
 ```python
 prepared = owner.outsourcedData(matrix)

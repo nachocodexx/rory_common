@@ -95,8 +95,8 @@ the matching `get()` call that you used in `put()`.
 | `List[int]` / `List[float]` | any | any | - | any | Auto-converted to a 1-D `float64` ndarray, then follows the ndarray rows below |
 | `ndarray` | `False` | `False` | any | any | Single plaintext blob |
 | `ndarray` | `False` | `True` | any | any | Split into `num_chunks` plaintext chunks |
-| `ndarray` | `True` | `False` | any | CKKS / Liu | Encrypt through a scheme-only DataOwner as one logical chunk |
-| `ndarray` | `True` | `True` | any | CKKS / Liu | Segment and encrypt chunks in parallel through DataOwner |
+| `ndarray` | `True` | `False` | any | CKKS / Liu | Encrypt through the DataOwner's primary scheme as one logical chunk |
+| `ndarray` | `True` | `True` | any | CKKS / Liu | Segment and encrypt chunks in parallel through the DataOwner's primary scheme |
 | `PyCtxt` or sequence of `PyCtxt` | `True` | any | - | CKKS | Serialize prepared ciphertext without re-encrypting |
 
 ### What `get()` returns
@@ -111,11 +111,10 @@ the matching `get()` call that you used in `put()`.
 | `False` | `True` | any | `np.ndarray` |
 | `False` | `False` | any | `np.ndarray` |
 
-Direct encrypted ndarray storage accepts scheme-only owners (`Algorithm.NONE`).
-Algorithm-configured owners must process the complete dataset with
-`outsourcedData()` first. Store the selected prepared artifact through the
-plaintext/chunk path, or pass prepared CKKS `PyCtxt` values with `encrypt=True`.
-This prevents invalid per-chunk UDM/DM generation.
+Direct encrypted ndarray storage accepts scheme-only and algorithm-configured
+owners. It uses only the owner's primary Liu/CKKS scheme and does not execute the
+algorithm recipe per chunk. Generate complete-dataset artifacts such as UDM/DM
+separately with `outsourcedData()`, then store the selected prepared artifact.
 
 ### Delete before put (`delete=True`)
 

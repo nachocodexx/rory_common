@@ -117,7 +117,8 @@ def test_parallel_ckks_rebuilds_workers_from_shared_keys(dataowner_pqc, ckks):
     assert len(ciphertexts) == 8
 
 
-def test_parallel_storage_rejects_algorithm_dataowner():
+def test_parallel_storage_uses_algorithm_dataowner_scheme_only():
+    plaintext = np.arange(8, dtype=np.float64).reshape(4, 2)
     dataowner = (
         DataOwner.with_algorithm(Algorithm.SKMEANS)
         .with_scheme(RoryScheme.LIU)
@@ -125,13 +126,45 @@ def test_parallel_storage_rejects_algorithm_dataowner():
         .build()
     )
 
-    with pytest.raises(ValueError, match="Algorithm.NONE"):
-        Common.segment_and_encrypt_with_dataowner(
-            key="algorithm-owner",
-            plaintext=np.ones((4, 2)),
-            dataowner=dataowner,
-            num_chunks=2,
-        )
+    chunks, _, _ = Common.segment_and_encrypt_with_dataowner(
+        key="algorithm-owner",
+        plaintext=plaintext,
+        dataowner=dataowner,
+        num_chunks=2,
+    )
+
+    encrypted = np.concatenate(
+        [chunk.to_ndarray().unwrap() for chunk in chunks],
+        axis=0,
+    )
+    decrypted = dataowner.primary_scheme.decrypt_matrix(encrypted).data
+    np.testing.assert_allclose(decrypted, plaintext, atol=1e-12)
+
+
+def test_storage_scheme_encryption_does_not_run_algorithm_recipe(monkeypatch):
+    plaintext = np.arange(6, dtype=np.float64).reshape(3, 2)
+    dataowner = (
+        DataOwner.with_algorithm(Algorithm.SKMEANS)
+        .with_scheme(RoryScheme.LIU)
+        .with_scheme_params(_liu_params())
+        .build()
+    )
+
+    def unexpected_recipe(*args, **kwargs):
+        raise AssertionError("storage must not execute outsourcedData()")
+
+    monkeypatch.setattr(dataowner, "outsourcedData", unexpected_recipe)
+
+    chunks, _, _ = Common.segment_and_encrypt_with_dataowner(
+        key="scheme-only-encryption",
+        plaintext=plaintext,
+        dataowner=dataowner,
+        num_chunks=1,
+    )
+
+    encrypted = next(iter(chunks.iter())).to_ndarray().unwrap()
+    decrypted = dataowner.primary_scheme.decrypt_matrix(encrypted).data
+    np.testing.assert_allclose(decrypted, plaintext, atol=1e-12)
 
 
 def test_parallel_storage_caps_chunks_to_axis_zero_length():
